@@ -216,6 +216,7 @@ int main(int argc, char *argv[])
     struct timespec next_frame;
     clock_gettime(CLOCK_MONOTONIC, &next_frame);
 
+    int notified = 0;
     while (!quit) {
         for (float frame = 0; frame < total_frames && !quit; frame += frame_step) {
             tvg_animation_set_frame(anim, frame);
@@ -236,13 +237,24 @@ int main(int argc, char *argv[])
             sleep_until(&next_frame);
         }
 
+        if (!notified) {
+            sd_notify_ready();
+            notified = 1;
+        }
+
         if (once) break;
     }
 
-    /* Signal systemd that dependents can start, then do fade */
-    sd_notify_ready();
+    /* In --once mode, hold the last frame visible until SIGTERM */
+    if (once && !quit) {
+        fprintf(stderr, "holding last frame until SIGTERM\n");
+        while (!quit)
+            pause();
+    }
 
-    if (fade_ms > 0 && !quit) {
+    /* Always fade on exit — first SIGTERM triggers fade, second aborts it */
+    quit = 0;
+    if (fade_ms > 0) {
         int fade_steps = fade_ms / frame_ms;
         if (fade_steps < 2) fade_steps = 2;
 
@@ -250,6 +262,7 @@ int main(int argc, char *argv[])
         if (last_frame) {
             memcpy(last_frame, argb_buf, width * height * sizeof(uint32_t));
 
+            clock_gettime(CLOCK_MONOTONIC, &next_frame);
             for (int step = 1; step <= fade_steps && !quit; step++) {
                 float alpha = 1.0f - (float)step / fade_steps;
                 for (int i = 0; i < width * height; i++) {
