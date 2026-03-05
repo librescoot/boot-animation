@@ -203,6 +203,14 @@ int main(int argc, char *argv[])
         goto cleanup_anim;
     }
 
+    if (duration <= 0.0f) {
+        if (target_fps <= 0) {
+            fprintf(stderr, "animation duration is 0 — use --fps to specify frame rate\n");
+            goto cleanup_anim;
+        }
+        duration = total_frames / (float)target_fps;
+    }
+
     float native_fps = total_frames / duration;
     float render_fps = (target_fps > 0) ? target_fps : native_fps;
     float frame_step = native_fps / render_fps;
