@@ -238,16 +238,16 @@ int main(int argc, char *argv[])
                 memcpy(fb_mmap, argb_buf, width * height * 4);
             }
 
+            if (!notified) {
+                sd_notify_ready();
+                notified = 1;
+            }
+
             if ((int)frame % 100 == 0)
                 fprintf(stderr, "frame %.0f/%.0f\n", frame, total_frames);
 
             timespec_add_ms(&next_frame, frame_ms);
             sleep_until(&next_frame);
-        }
-
-        if (!notified) {
-            sd_notify_ready();
-            notified = 1;
         }
 
         if (once) break;
