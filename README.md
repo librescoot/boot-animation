@@ -1,6 +1,8 @@
 # boot-animation
 
-Renders a Lottie JSON animation to `/dev/fb0` using [ThorVG](https://www.thorvg.org/)'s software renderer. Designed as the boot splash for LibreScoot's Dashboard Computer (i.MX6 Cortex-A9, 480×480 RGB565 display).
+Renders a Lottie JSON animation to `/dev/fb0` using [ThorVG](https://www.thorvg.org/)'s software renderer. Designed as the boot splash for Librescoot's Dashboard Computer (i.MX6 Cortex-A9, 480×480 RGB565 display).
+
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 ## Features
 
@@ -95,3 +97,14 @@ The service is `Type=notify` and runs in `sysinit.target` before `multi-user.tar
 - The renderer always works in ARGB8888 internally (ThorVG requirement).
 - For 16bpp displays, each rendered frame is converted to RGB565 before writing to the framebuffer.
 - The animation is scaled uniformly (letterboxed) to fit the display dimensions reported by `FBIOGET_VSCREENINFO`.
+
+## License
+
+This project is dual-licensed. The source code is available under the
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
+The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+
+[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
+
+[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
+[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
