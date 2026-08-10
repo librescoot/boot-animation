@@ -6,6 +6,7 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 ## Features
 
+- Plays prerendered frame streams, falling back to rasterising Lottie live
 - Software-rendered Lottie animation via ThorVG (no GPU required)
 - Supports 16bpp (RGB565) and 32bpp (ARGB8888) framebuffers
 - Scales animation proportionally to fit display resolution
@@ -17,9 +18,39 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 ## Dependencies
 
 - [ThorVG](https://github.com/thorvg/thorvg) with C API bindings (`-lthorvg`)
+- zlib (`-lz`)
 - `libc`, `libstdc++`, `libm`, `libpthread`
 
 ThorVG must be built with Lottie support enabled.
+
+## Prerendered streams
+
+Rasterising Lottie is expensive. On the DBC a 480×480 frame costs around 80 ms
+against a 40 ms budget, so the animation runs at roughly half speed and eats CPU
+that the dashboard needs to start. Packing the frames at build time turns each
+one into a decompress and a memcpy: about 6 ms idle, 12 ms while the dashboard
+is loading, and the animation keeps its intended length.
+
+`tools/lottie2stream` renders an animation with the same ThorVG setup the player
+uses and writes a `.lsba` file:
+
+```sh
+make tools
+bin/lottie2stream librescoot.json 480 480 25 librescoot.lsba
+bin/lottie2stream windowsxp.json 480 480 25 windowsxp.lsba --loop
+```
+
+At runtime, given `foo.json`, the player looks for `foo.lsba` beside it and uses
+it when the geometry matches the framebuffer. A stream can also be passed
+directly. Anything else — no stream, a different panel size, a framebuffer that
+is not 16bpp, a malformed file — falls back to rendering the JSON live, so a
+splash always appears.
+
+Streams are RGB565 with each frame compressed independently. That costs almost
+nothing in size against compressing the whole sequence, and it keeps runtime
+memory at a single frame while letting playback skip ahead when a decode
+overruns its slot. For reference, 480×480 at 25 fps: 2.5 MiB for an 8 s
+animation, 0.4 MiB for a 2 s loop.
 
 ## Building
 
@@ -45,7 +76,7 @@ make build-host
 
 ### Yocto / BitBake
 
-The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs thorvg-1` and installs the binary to `/usr/bin/boot-animation`.
+The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs thorvg-1` and installs the binary to `/usr/bin/boot-animation`. It also builds `lottie2stream` against `thorvg-native` and packs a stream for each shipped animation into `/usr/share/boot-animation/`.
 
 ## Usage
 
@@ -55,7 +86,7 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `<lottie.json>` | *(required)* | Path to the Lottie animation file |
+| `<lottie.json>` | *(required)* | Path to the Lottie animation, or to a `.lsba` stream |
 | `--fps N` | animation's native FPS | Target render frame rate; also used if the animation reports zero duration |
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
@@ -84,18 +115,18 @@ boot.animation=librescoot   → /usr/share/boot-animation/librescoot.json (defau
 boot.animation=windowsxp    → /usr/share/boot-animation/windowsxp.json
 ```
 
-If the parameter is absent, `librescoot` is used. The `librescoot` animation is played in `--once` mode (holds last frame until Flutter takes over); other animations loop indefinitely.
+If the parameter is absent, `librescoot` is used. The `librescoot` animation is played in `--once` mode (holds its last frame until the dashboard takes the display over); other animations loop indefinitely. Each shipped animation has a prerendered `.lsba` stream beside its JSON.
 
 ## Systemd Integration
 
 The service is `Type=notify` and runs in `sysinit.target` before `multi-user.target`. It unbinds the fbcon VT console (`vtcon1`) before starting to prevent the kernel text console from overwriting the framebuffer.
 
-`dbc-dispatcher.service` has an `After=boot-animation.service` drop-in so Flutter only starts after the boot animation signals ready.
+`dbc-dispatcher.service` has an `After=boot-animation.service` drop-in so the dashboard only starts after the boot animation signals ready.
 
 ## Framebuffer Notes
 
-- The renderer always works in ARGB8888 internally (ThorVG requirement).
-- For 16bpp displays, each rendered frame is converted to RGB565 before writing to the framebuffer.
+- When rasterising live, the renderer works in ARGB8888 internally (ThorVG requirement), and each frame is converted to RGB565 before writing to a 16bpp framebuffer.
+- Streams are already RGB565, so playback is a decompress straight into the framebuffer. They are therefore 16bpp only; a 32bpp panel rasterises live.
 - The animation is scaled uniformly (letterboxed) to fit the display dimensions reported by `FBIOGET_VSCREENINFO`.
 
 ## License

@@ -20,7 +20,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <linux/fb.h>
+#include <limits.h>
+#include <zlib.h>
 #include <thorvg_capi.h>
+
+#include "stream.h"
 
 static volatile sig_atomic_t quit = 0;
 
@@ -81,6 +85,220 @@ static long elapsed_ms(const struct timespec *since)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - since->tv_sec) * 1000L +
            (now.tv_nsec - since->tv_nsec) / 1000000L;
+}
+
+/* ---------------------------------------------------------------- streams */
+
+struct stream {
+    uint8_t *data;
+    size_t size;
+    struct stream_header h;
+    uint32_t *clen;      /* compressed length per frame */
+    size_t *offset;      /* offset into data of each frame's payload */
+    uint16_t *frame;     /* decode scratch, one frame */
+};
+
+static void stream_free(struct stream *s)
+{
+    if (!s)
+        return;
+    free(s->data);
+    free(s->clen);
+    free(s->offset);
+    free(s->frame);
+    free(s);
+}
+
+/*
+ * Load <lottie>.lsba, or the given path if it already is one. Returns NULL
+ * whenever the stream is missing, malformed, or does not match the panel we
+ * opened, so every failure lands on live rasterising rather than a blank
+ * screen.
+ */
+static struct stream *stream_load(const char *lottie_path, int width, int height, int bpp)
+{
+    char path[PATH_MAX];
+    const char *dot = strrchr(lottie_path, '.');
+
+    if (dot && strcmp(dot, ".lsba") == 0) {
+        snprintf(path, sizeof(path), "%s", lottie_path);
+    } else {
+        size_t stem = dot ? (size_t)(dot - lottie_path) : strlen(lottie_path);
+        if (stem + sizeof(".lsba") > sizeof(path))
+            return NULL;
+        snprintf(path, sizeof(path), "%.*s.lsba", (int)stem, lottie_path);
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+
+    struct stream *s = calloc(1, sizeof(*s));
+    if (!s) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(&s->h, sizeof(s->h), 1, f) != 1 ||
+        memcmp(s->h.magic, STREAM_MAGIC, 4) != 0 ||
+        s->h.version != STREAM_VERSION ||
+        s->h.format != STREAM_FMT_RGB565LE ||
+        s->h.frame_count == 0 || s->h.interval_ms == 0) {
+        fprintf(stderr, "%s: not a usable stream\n", path);
+        goto fail;
+    }
+
+    if ((int)s->h.width != width || (int)s->h.height != height || bpp != 16) {
+        fprintf(stderr, "%s: %ux%u RGB565 does not match fb0 %dx%d %dbpp\n",
+                path, s->h.width, s->h.height, width, height, bpp);
+        goto fail;
+    }
+
+    long start = ftell(f);
+    if (fseek(f, 0, SEEK_END) != 0)
+        goto fail;
+    s->size = (size_t)(ftell(f) - start);
+    if (fseek(f, start, SEEK_SET) != 0)
+        goto fail;
+
+    s->data = malloc(s->size);
+    if (!s->data || fread(s->data, 1, s->size, f) != s->size) {
+        fprintf(stderr, "%s: short read\n", path);
+        goto fail;
+    }
+    fclose(f);
+    f = NULL;
+
+    /* Walk the length prefixes to index the frames. No decompression, so this
+       stays cheap even for a long animation. */
+    s->clen = malloc(s->h.frame_count * sizeof(*s->clen));
+    s->offset = malloc(s->h.frame_count * sizeof(*s->offset));
+    s->frame = malloc((size_t)width * height * 2);
+    if (!s->clen || !s->offset || !s->frame)
+        goto fail;
+
+    size_t off = 0;
+    for (uint32_t i = 0; i < s->h.frame_count; i++) {
+        if (off + 4 > s->size)
+            goto truncated;
+        memcpy(&s->clen[i], s->data + off, 4);
+        off += 4;
+        if (s->clen[i] == 0 || off + s->clen[i] > s->size)
+            goto truncated;
+        s->offset[i] = off;
+        off += s->clen[i];
+    }
+
+    fprintf(stderr, "stream %s: %u frames, %ums interval%s\n",
+            path, s->h.frame_count, s->h.interval_ms,
+            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "");
+    return s;
+
+truncated:
+    fprintf(stderr, "%s: truncated frame table\n", path);
+fail:
+    if (f)
+        fclose(f);
+    stream_free(s);
+    return NULL;
+}
+
+/* Decode one frame into scratch and push it to the panel. */
+static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_bytes)
+{
+    uLongf out_len = frame_bytes;
+    int rc = uncompress((Bytef *)s->frame, &out_len,
+                        s->data + s->offset[idx], s->clen[idx]);
+    if (rc != Z_OK || out_len != frame_bytes) {
+        fprintf(stderr, "frame %u: uncompress failed (%d)\n", idx, rc);
+        return -1;
+    }
+    memcpy(fb, s->frame, frame_bytes);
+    return 0;
+}
+
+/*
+ * Play the stream, picking each frame from elapsed wall time. Under boot load
+ * a decode can overrun its slot, and skipping ahead keeps the run at its
+ * intended length instead of stretching it; independently compressed frames
+ * are what make the skip free. Leaves the last shown frame in s->frame for
+ * the caller to fade out.
+ */
+static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once)
+{
+    const uint32_t last = s->h.frame_count - 1;
+    int notified = 0;
+
+    while (!quit) {
+        struct timespec run_start;
+        clock_gettime(CLOCK_MONOTONIC, &run_start);
+        uint32_t shown = UINT32_MAX;
+
+        for (;;) {
+            long ms = elapsed_ms(&run_start);
+            uint32_t idx = (uint32_t)(ms / (long)s->h.interval_ms);
+            int final = idx >= last;
+            if (final)
+                idx = last;
+
+            if (idx != shown) {
+                if (stream_show(s, idx, fb, frame_bytes) < 0)
+                    return;
+                shown = idx;
+                if (!notified) {
+                    sd_notify_ready();
+                    notified = 1;
+                }
+            }
+
+            if (final || quit)
+                break;
+
+            struct timespec next;
+            clock_gettime(CLOCK_MONOTONIC, &next);
+            timespec_add_ms(&next, s->h.interval_ms);
+            sleep_until(&next);
+        }
+
+        if (once || quit || !(s->h.flags & STREAM_FLAG_LOOP))
+            break;
+    }
+}
+
+/* Fade the frame we ended on down to black, then clear. */
+static void stream_fade_out(struct stream *s, void *fb, int width, int height,
+                            int fade_ms, size_t fb_size)
+{
+    if (fade_ms > 0) {
+        long frame_ms = s->h.interval_ms;
+        int steps = fade_ms / (int)frame_ms;
+        if (steps < 2)
+            steps = 2;
+
+        uint16_t *last = malloc((size_t)width * height * 2);
+        if (last) {
+            memcpy(last, s->frame, (size_t)width * height * 2);
+
+            struct timespec next;
+            clock_gettime(CLOCK_MONOTONIC, &next);
+            for (int step = 1; step <= steps && !quit; step++) {
+                float alpha = 1.0f - (float)step / steps;
+                uint16_t *dst = fb;
+                for (int i = 0; i < width * height; i++) {
+                    uint16_t px = last[i];
+                    uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * alpha);
+                    uint8_t g = (uint8_t)(((px >>  5) & 0x3F) * alpha);
+                    uint8_t b = (uint8_t)(( px        & 0x1F) * alpha);
+                    dst[i] = (r << 11) | (g << 5) | b;
+                }
+                timespec_add_ms(&next, frame_ms);
+                sleep_until(&next);
+            }
+            free(last);
+        }
+    }
+
+    memset(fb, 0, fb_size);
 }
 
 int main(int argc, char *argv[])
@@ -144,6 +362,34 @@ int main(int argc, char *argv[])
         perror("mmap fb");
         close(fb_fd);
         return 1;
+    }
+
+    /*
+     * Prefer a prerendered stream. Rasterising Lottie costs more per frame
+     * than the frame budget on the DBC, which both stretches the animation
+     * and steals CPU from the dashboard we are waiting for; a packed stream
+     * is a decompress and a memcpy. Any reason not to use one (absent,
+     * malformed, different geometry) falls through to rendering it live.
+     */
+    struct stream *stream = stream_load(lottie_path, width, height, bpp);
+    if (stream) {
+        const size_t frame_bytes = (size_t)width * height * 2;
+
+        stream_play(stream, fb_mmap, frame_bytes, once);
+
+        if (once && !quit) {
+            fprintf(stderr, "holding last frame until SIGTERM\n");
+            while (!quit)
+                pause();
+        }
+
+        quit = 0;
+        stream_fade_out(stream, fb_mmap, width, height, fade_ms, fb_size);
+
+        stream_free(stream);
+        munmap(fb_mmap, fb_size);
+        close(fb_fd);
+        return 0;
     }
 
     if (tvg_engine_init(0) != TVG_RESULT_SUCCESS) {

@@ -11,24 +11,32 @@ CFLAGS ?= -O2 -Wall
 CFLAGS += $(addprefix -I,$(THORVG_INC))
 LDFLAGS ?=
 LDFLAGS += -L$(THORVG_BUILD)/src
-LIBS := -lthorvg -lstdc++ -lm -lpthread
+LIBS := -lthorvg -lstdc++ -lm -lpthread -lz
 
 CC_ARM := arm-linux-gnueabihf-gcc
 
-.PHONY: build build-arm build-host dist clean
+.PHONY: build build-arm build-host tools dist clean
 
 build-host: $(BUILD_DIR)/$(BINARY_NAME)
 	@echo "Built $(BUILD_DIR)/$(BINARY_NAME) for host"
 
-$(BUILD_DIR)/$(BINARY_NAME): main.c
+$(BUILD_DIR)/$(BINARY_NAME): main.c stream.h
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ main.c $(LIBS)
 
 build: build-arm
 
 build-arm:
 	mkdir -p $(BUILD_DIR)
 	$(CC_ARM) $(CFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) main.c $(LIBS)
+
+# Build-time packer. Always a host binary: it runs during the image build,
+# not on the vehicle.
+tools: $(BUILD_DIR)/lottie2stream
+
+$(BUILD_DIR)/lottie2stream: tools/lottie2stream.c stream.h
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/lottie2stream.c $(LIBS)
 
 dist: build
 	arm-linux-gnueabihf-strip $(BUILD_DIR)/$(BINARY_NAME)
