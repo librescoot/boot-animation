@@ -75,6 +75,14 @@ static void timespec_add_ms(struct timespec *ts, long ms)
     }
 }
 
+static long elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - since->tv_sec) * 1000L +
+           (now.tv_nsec - since->tv_nsec) / 1000000L;
+}
+
 int main(int argc, char *argv[])
 {
     const char *lottie_path = NULL;
@@ -213,20 +221,33 @@ int main(int argc, char *argv[])
 
     float native_fps = total_frames / duration;
     float render_fps = (target_fps > 0) ? target_fps : native_fps;
-    float frame_step = native_fps / render_fps;
     long frame_ms = (long)(1000.0f / render_fps);
 
-    fprintf(stderr, "animation: %.0f frames, %.2fs, native %.1f fps, render %.1f fps (step=%.2f, frame_ms=%ld)\n",
-            total_frames, duration, native_fps, render_fps, frame_step, frame_ms);
+    fprintf(stderr, "animation: %.0f frames, %.2fs, native %.1f fps, render cap %.1f fps (frame_ms=%ld)\n",
+            total_frames, duration, native_fps, render_fps, frame_ms);
 
     tvg_canvas_add(canvas, picture);
 
-    struct timespec next_frame;
-    clock_gettime(CLOCK_MONOTONIC, &next_frame);
-
     int notified = 0;
     while (!quit) {
-        for (float frame = 0; frame < total_frames && !quit; frame += frame_step) {
+        /*
+         * Pick the frame from elapsed wall time rather than stepping a counter.
+         * On the DBC a render costs more than its slot during boot (we compete
+         * with the dashboard's startup for the CPU), and a counter would stretch
+         * an 8s animation to 16s. Dropping frames keeps the run at `duration`
+         * seconds, so we reliably reach the final frame before the dashboard
+         * takes the display over.
+         */
+        struct timespec run_start;
+        clock_gettime(CLOCK_MONOTONIC, &run_start);
+        int last_reported = -1;
+
+        for (;;) {
+            float frame = elapsed_ms(&run_start) * native_fps / 1000.0f;
+            int final = frame >= total_frames - 1;
+            if (final)
+                frame = total_frames - 1;
+
             tvg_animation_set_frame(anim, frame);
             tvg_canvas_update(canvas);
             tvg_canvas_draw(canvas, true);
@@ -243,14 +264,21 @@ int main(int argc, char *argv[])
                 notified = 1;
             }
 
-            if ((int)frame % 100 == 0)
+            if ((int)frame / 100 != last_reported) {
+                last_reported = (int)frame / 100;
                 fprintf(stderr, "frame %.0f/%.0f\n", frame, total_frames);
+            }
 
+            if (final || quit)
+                break;
+
+            struct timespec next_frame;
+            clock_gettime(CLOCK_MONOTONIC, &next_frame);
             timespec_add_ms(&next_frame, frame_ms);
             sleep_until(&next_frame);
         }
 
-        if (once) break;
+        if (once || quit) break;
     }
 
     /* In --once mode, hold the last frame visible until SIGTERM */
@@ -270,6 +298,7 @@ int main(int argc, char *argv[])
         if (last_frame) {
             memcpy(last_frame, argb_buf, width * height * sizeof(uint32_t));
 
+            struct timespec next_frame;
             clock_gettime(CLOCK_MONOTONIC, &next_frame);
             for (int step = 1; step <= fade_steps && !quit; step++) {
                 float alpha = 1.0f - (float)step / fade_steps;
