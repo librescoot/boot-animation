@@ -11,7 +11,7 @@ CFLAGS ?= -O2 -Wall
 CFLAGS += $(addprefix -I,$(THORVG_INC))
 LDFLAGS ?=
 LDFLAGS += -L$(THORVG_BUILD)/src
-LIBS := -lthorvg -lstdc++ -lm -lpthread -lz
+LIBS := -lthorvg -lstdc++ -lm -lpthread -lasound -lz
 
 CC_ARM := arm-linux-gnueabihf-gcc
 
