@@ -21,146 +21,17 @@
 #include <sys/un.h>
 #include <linux/fb.h>
 #include <limits.h>
-#include <pthread.h>
-#include <sys/stat.h>
-#include <alsa/asoundlib.h>
 #include <zlib.h>
 #include <thorvg_capi.h>
 
 #include "stream.h"
 
 static volatile sig_atomic_t quit = 0;
-static volatile sig_atomic_t audio_stop = 0;
 
 static void handle_signal(int sig)
 {
     (void)sig;
     quit = 1;
-    audio_stop = 1;
-}
-
-struct audio_playback {
-    const char *path;
-    pthread_t thread;
-    int started;
-};
-
-static uint16_t read_le16(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t read_le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void *play_wav(void *arg)
-{
-    const char *path = arg;
-    int fd = -1;
-    uint8_t *file = MAP_FAILED;
-    snd_pcm_t *pcm = NULL;
-    struct stat st;
-
-    fd = open(path, O_RDONLY);
-    if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 44)
-        goto done;
-
-    file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (file == MAP_FAILED)
-        goto done;
-    if (memcmp(file, "RIFF", 4) != 0 || memcmp(file + 8, "WAVE", 4) != 0)
-        goto invalid;
-
-    const uint8_t *fmt = NULL;
-    const uint8_t *data = NULL;
-    uint32_t fmt_size = 0;
-    uint32_t data_size = 0;
-    size_t offset = 12;
-    while (offset + 8 <= (size_t)st.st_size) {
-        uint32_t size = read_le32(file + offset + 4);
-        size_t payload = offset + 8;
-        if (payload + size > (size_t)st.st_size)
-            goto invalid;
-        if (memcmp(file + offset, "fmt ", 4) == 0) {
-            fmt = file + payload;
-            fmt_size = size;
-        } else if (memcmp(file + offset, "data", 4) == 0) {
-            data = file + payload;
-            data_size = size;
-        }
-        offset = payload + size + (size & 1u);
-    }
-
-    if (!fmt || fmt_size < 16 || !data || read_le16(fmt) != 1 ||
-        read_le16(fmt + 2) != 2 || read_le32(fmt + 4) != 48000 ||
-        read_le16(fmt + 14) != 16) {
-invalid:
-        fprintf(stderr, "%s: expected 48 kHz stereo 16-bit PCM WAV\n", path);
-        goto done;
-    }
-
-    int err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-    if (err < 0) {
-        fprintf(stderr, "startup audio: %s\n", snd_strerror(err));
-        goto done;
-    }
-    err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
-                             SND_PCM_ACCESS_RW_INTERLEAVED, 2, 48000, 1, 200000);
-    if (err < 0) {
-        fprintf(stderr, "startup audio params: %s\n", snd_strerror(err));
-        goto done;
-    }
-
-    const uint8_t *cursor = data;
-    snd_pcm_uframes_t frames = data_size / 4;
-    while (frames > 0 && !audio_stop) {
-        snd_pcm_sframes_t written = snd_pcm_writei(pcm, cursor, frames);
-        if (written == -EPIPE) {
-            snd_pcm_prepare(pcm);
-            continue;
-        }
-        if (written < 0) {
-            fprintf(stderr, "startup audio write: %s\n", snd_strerror((int)written));
-            break;
-        }
-        cursor += (size_t)written * 4;
-        frames -= (snd_pcm_uframes_t)written;
-    }
-    if (audio_stop)
-        snd_pcm_drop(pcm);
-    else
-        snd_pcm_drain(pcm);
-
-done:
-    if (pcm)
-        snd_pcm_close(pcm);
-    if (file != MAP_FAILED)
-        munmap(file, (size_t)st.st_size);
-    if (fd >= 0)
-        close(fd);
-    return NULL;
-}
-
-static void audio_start(struct audio_playback *audio, const char *path)
-{
-    if (!path)
-        return;
-    audio->path = path;
-    if (pthread_create(&audio->thread, NULL, play_wav, (void *)path) == 0)
-        audio->started = 1;
-    else
-        fprintf(stderr, "startup audio: failed to create playback thread\n");
-}
-
-static void audio_join(struct audio_playback *audio)
-{
-    if (audio->started) {
-        pthread_join(audio->thread, NULL);
-        audio->started = 0;
-    }
 }
 
 static void argb_to_rgb565(const uint32_t *src, uint16_t *dst, int count)
@@ -436,8 +307,6 @@ int main(int argc, char *argv[])
     int target_fps = 0;
     int fade_ms = 1000;
     int once = 0;
-    const char *sound_path = NULL;
-    struct audio_playback audio = {0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
@@ -446,15 +315,13 @@ int main(int argc, char *argv[])
             fade_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--once") == 0) {
             once = 1;
-        } else if (strcmp(argv[i], "--sound") == 0 && i + 1 < argc) {
-            sound_path = argv[++i];
         } else if (argv[i][0] != '-') {
             lottie_path = argv[i];
         }
     }
 
     if (!lottie_path) {
-        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]\n");
+        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]\n");
         return 1;
     }
 
@@ -497,8 +364,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    audio_start(&audio, sound_path);
-
     /*
      * Prefer a prerendered stream. Rasterising Lottie costs more per frame
      * than the frame budget on the DBC, which both stretches the animation
@@ -522,8 +387,6 @@ int main(int argc, char *argv[])
         stream_fade_out(stream, fb_mmap, width, height, fade_ms, fb_size);
 
         stream_free(stream);
-        audio_stop = 1;
-        audio_join(&audio);
         munmap(fb_mmap, fb_size);
         close(fb_fd);
         return 0;
@@ -716,8 +579,6 @@ cleanup_canvas:
 cleanup_engine:
     tvg_engine_term();
 cleanup_fb:
-    audio_stop = 1;
-    audio_join(&audio);
     munmap(fb_mmap, fb_size);
     close(fb_fd);
 

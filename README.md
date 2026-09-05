@@ -19,7 +19,6 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 - [ThorVG](https://github.com/thorvg/thorvg) with C API bindings (`-lthorvg`)
 - zlib (`-lz`)
-- ALSA library (`-lasound`)
 - `libc`, `libstdc++`, `libm`, `libpthread`
 
 ThorVG must be built with Lottie support enabled.
@@ -82,7 +81,7 @@ The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs tho
 ## Usage
 
 ```
-boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]
+boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
 ```
 
 | Option | Default | Description |
@@ -91,7 +90,6 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]
 | `--fps N` | animation's native FPS | Target render frame rate; also used if the animation reports zero duration |
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
-| `--sound WAV` | off | Play a stereo 48 kHz 16-bit PCM WAV through ALSA while the animation starts |
 
 ### Exit behaviour
 
