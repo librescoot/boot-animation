@@ -36,7 +36,6 @@ static void handle_signal(int sig)
 {
     (void)sig;
     quit = 1;
-    audio_stop = 1;
 }
 
 struct audio_playback {
