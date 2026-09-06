@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 /*
  * boot-animation: Lottie animation renderer for /dev/fb0
  *
@@ -40,9 +42,61 @@ static void handle_signal(int sig)
 
 struct audio_playback {
     const char *path;
+    char *device;
     pthread_t thread;
     int started;
 };
+
+static char *select_audio_device(const char *configured)
+{
+    if (configured && configured[0] && strcmp(configured, "auto") != 0)
+        return strdup(configured);
+
+    void **hints = NULL;
+    char *builtin = NULL;
+    char *usb = NULL;
+    char *fallback = NULL;
+    if (snd_device_name_hint(-1, "pcm", &hints) < 0)
+        return NULL;
+
+    for (void **hint = hints; *hint; hint++) {
+        char *name = snd_device_name_get_hint(*hint, "NAME");
+        char *desc = snd_device_name_get_hint(*hint, "DESC");
+        char *io = snd_device_name_get_hint(*hint, "IOID");
+        int output = !io || strcmp(io, "Input") != 0;
+        if (output && name) {
+            if (!fallback && strcmp(name, "null") != 0)
+                fallback = strdup(name);
+            if (!builtin && (strcasestr(name, "tas5720") ||
+                             (desc && strcasestr(desc, "tas5720"))))
+                builtin = strdup(name);
+            if (!usb && (strcasestr(name, "usb") ||
+                         (desc && strcasestr(desc, "usb"))))
+                usb = strdup(name);
+        }
+        free(name);
+        free(desc);
+        free(io);
+    }
+    snd_device_name_free_hint(hints);
+
+    char *selected = builtin ? builtin : (usb ? usb : fallback);
+    if (selected != builtin)
+        free(builtin);
+    if (selected != usb)
+        free(usb);
+    if (selected != fallback)
+        free(fallback);
+    return selected;
+}
+
+static int audio_timed_out(const struct timespec *deadline)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec > deadline->tv_sec ||
+           (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
+}
 
 static uint16_t read_le16(const uint8_t *p)
 {
@@ -57,7 +111,8 @@ static uint32_t read_le32(const uint8_t *p)
 
 static void *play_wav(void *arg)
 {
-    const char *path = arg;
+    struct audio_playback *audio = arg;
+    const char *path = audio->path;
     int fd = -1;
     uint8_t *file = MAP_FAILED;
     snd_pcm_t *pcm = NULL;
@@ -101,9 +156,11 @@ invalid:
         goto done;
     }
 
-    int err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    int err = snd_pcm_open(&pcm, audio->device, SND_PCM_STREAM_PLAYBACK,
+                           SND_PCM_NONBLOCK);
     if (err < 0) {
-        fprintf(stderr, "startup audio: %s\n", snd_strerror(err));
+        fprintf(stderr, "startup audio disabled (%s): %s\n",
+                audio->device, snd_strerror(err));
         goto done;
     }
     err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
@@ -113,25 +170,36 @@ invalid:
         goto done;
     }
 
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += data_size / 192000 + 3;
+
     const uint8_t *cursor = data;
     snd_pcm_uframes_t frames = data_size / 4;
-    while (frames > 0 && !audio_stop) {
+    while (frames > 0 && !audio_stop && !audio_timed_out(&deadline)) {
         snd_pcm_sframes_t written = snd_pcm_writei(pcm, cursor, frames);
-        if (written == -EPIPE) {
-            snd_pcm_prepare(pcm);
+        if (written == -EAGAIN) {
+            snd_pcm_wait(pcm, 100);
             continue;
         }
         if (written < 0) {
-            fprintf(stderr, "startup audio write: %s\n", snd_strerror((int)written));
+            int recovered = snd_pcm_recover(pcm, (int)written, 1);
+            if (recovered >= 0)
+                continue;
+            fprintf(stderr, "startup audio disabled: %s\n", snd_strerror(recovered));
             break;
         }
         cursor += (size_t)written * 4;
         frames -= (snd_pcm_uframes_t)written;
     }
-    if (audio_stop)
+
+    if (frames == 0 && !audio_stop) {
+        while ((err = snd_pcm_drain(pcm)) == -EAGAIN &&
+               !audio_timed_out(&deadline))
+            snd_pcm_wait(pcm, 100);
+    }
+    if (frames > 0 || err < 0 || audio_stop)
         snd_pcm_drop(pcm);
-    else
-        snd_pcm_drain(pcm);
 
 done:
     if (pcm)
@@ -143,15 +211,24 @@ done:
     return NULL;
 }
 
-static void audio_start(struct audio_playback *audio, const char *path)
+static void audio_start(struct audio_playback *audio, const char *path,
+                        const char *configured_device)
 {
     if (!path)
         return;
     audio->path = path;
-    if (pthread_create(&audio->thread, NULL, play_wav, (void *)path) == 0)
+    audio->device = select_audio_device(configured_device);
+    if (!audio->device) {
+        fprintf(stderr, "startup audio disabled: no output available\n");
+        return;
+    }
+    if (pthread_create(&audio->thread, NULL, play_wav, audio) == 0) {
         audio->started = 1;
-    else
-        fprintf(stderr, "startup audio: failed to create playback thread\n");
+    } else {
+        fprintf(stderr, "startup audio disabled: failed to create playback thread\n");
+        free(audio->device);
+        audio->device = NULL;
+    }
 }
 
 static void audio_join(struct audio_playback *audio)
@@ -160,6 +237,8 @@ static void audio_join(struct audio_playback *audio)
         pthread_join(audio->thread, NULL);
         audio->started = 0;
     }
+    free(audio->device);
+    audio->device = NULL;
 }
 
 static void argb_to_rgb565(const uint32_t *src, uint16_t *dst, int count)
@@ -436,6 +515,7 @@ int main(int argc, char *argv[])
     int fade_ms = 1000;
     int once = 0;
     const char *sound_path = NULL;
+    const char *audio_device = "auto";
     struct audio_playback audio = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -447,13 +527,15 @@ int main(int argc, char *argv[])
             once = 1;
         } else if (strcmp(argv[i], "--sound") == 0 && i + 1 < argc) {
             sound_path = argv[++i];
+        } else if (strcmp(argv[i], "--audio-device") == 0 && i + 1 < argc) {
+            audio_device = argv[++i];
         } else if (argv[i][0] != '-') {
             lottie_path = argv[i];
         }
     }
 
     if (!lottie_path) {
-        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]\n");
+        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]\n");
         return 1;
     }
 
@@ -496,7 +578,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    audio_start(&audio, sound_path);
+    audio_start(&audio, sound_path, audio_device);
 
     /*
      * Prefer a prerendered stream. Rasterising Lottie costs more per frame

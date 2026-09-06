@@ -82,7 +82,7 @@ The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs tho
 ## Usage
 
 ```
-boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]
+boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]
 ```
 
 | Option | Default | Description |
@@ -92,6 +92,11 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV]
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
 | `--sound WAV` | off | Play a stereo 48 kHz 16-bit PCM WAV through ALSA while the animation starts |
+| `--audio-device PCM` | `auto` | ALSA PCM name; auto prefers TAS5720, then USB, then another output |
+
+Audio is best-effort: the output is selected and opened once, and any missing device,
+unsupported format, timeout, or playback error disables audio without delaying the animation.
+Runtime audio-device hotplug is not monitored.
 
 ### Exit behaviour
 
