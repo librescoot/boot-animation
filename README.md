@@ -95,9 +95,10 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--a
 | `--sound WAV` | off | Play a stereo 48 kHz 16-bit PCM WAV through ALSA while the animation starts |
 | `--audio-device PCM` | `auto` | ALSA PCM name; auto prefers TAS5720, then USB, then another output |
 
-Audio is best-effort: the output is selected and opened once, and any missing device,
-unsupported format, timeout, or playback error disables audio without delaying the animation.
-Runtime audio-device hotplug is not monitored.
+Audio is best-effort: a separate worker waits up to 15 seconds for the selected
+output to become usable, covering sound cards that register late during boot. Missing
+devices, unsupported formats, timeouts, and playback errors never delay the animation.
+Runtime audio-device hotplug after that startup window is not monitored.
 
 ### Exit behaviour
 

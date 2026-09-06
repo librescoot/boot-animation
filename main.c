@@ -42,7 +42,7 @@ static void handle_signal(int sig)
 
 struct audio_playback {
     const char *path;
-    char *device;
+    const char *configured_device;
     pthread_t thread;
     int started;
 };
@@ -116,6 +116,7 @@ static void *play_wav(void *arg)
     int fd = -1;
     uint8_t *file = MAP_FAILED;
     snd_pcm_t *pcm = NULL;
+    char *device = NULL;
     struct stat st;
 
     fd = open(path, O_RDONLY);
@@ -156,21 +157,38 @@ invalid:
         goto done;
     }
 
-    int err = snd_pcm_open(&pcm, audio->device, SND_PCM_STREAM_PLAYBACK,
-                           SND_PCM_NONBLOCK);
-    if (err < 0) {
-        fprintf(stderr, "startup audio disabled (%s): %s\n",
-                audio->device, snd_strerror(err));
-        goto done;
-    }
-    err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
-                             SND_PCM_ACCESS_RW_INTERLEAVED, 2, 48000, 1, 200000);
-    if (err < 0) {
-        fprintf(stderr, "startup audio params: %s\n", snd_strerror(err));
-        goto done;
-    }
-
     struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += 15;
+
+    int err = -ENODEV;
+    while (!audio_stop && !audio_timed_out(&deadline)) {
+        device = select_audio_device(audio->configured_device);
+        if (device) {
+            err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK,
+                               SND_PCM_NONBLOCK);
+            if (err >= 0) {
+                err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
+                                         SND_PCM_ACCESS_RW_INTERLEAVED,
+                                         2, 48000, 1, 200000);
+                if (err >= 0)
+                    break;
+                snd_pcm_close(pcm);
+                pcm = NULL;
+            }
+            free(device);
+            device = NULL;
+        }
+        struct timespec retry = { .tv_sec = 0, .tv_nsec = 250000000L };
+        nanosleep(&retry, NULL);
+    }
+    if (!pcm) {
+        if (!audio_stop)
+            fprintf(stderr, "startup audio disabled: no usable output after 15s\n");
+        goto done;
+    }
+    fprintf(stderr, "startup audio: using %s\n", device);
+
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += data_size / 192000 + 3;
 
@@ -204,6 +222,7 @@ invalid:
 done:
     if (pcm)
         snd_pcm_close(pcm);
+    free(device);
     if (file != MAP_FAILED)
         munmap(file, (size_t)st.st_size);
     if (fd >= 0)
@@ -217,17 +236,11 @@ static void audio_start(struct audio_playback *audio, const char *path,
     if (!path)
         return;
     audio->path = path;
-    audio->device = select_audio_device(configured_device);
-    if (!audio->device) {
-        fprintf(stderr, "startup audio disabled: no output available\n");
-        return;
-    }
+    audio->configured_device = configured_device;
     if (pthread_create(&audio->thread, NULL, play_wav, audio) == 0) {
         audio->started = 1;
     } else {
         fprintf(stderr, "startup audio disabled: failed to create playback thread\n");
-        free(audio->device);
-        audio->device = NULL;
     }
 }
 
@@ -237,8 +250,6 @@ static void audio_join(struct audio_playback *audio)
         pthread_join(audio->thread, NULL);
         audio->started = 0;
     }
-    free(audio->device);
-    audio->device = NULL;
 }
 
 static void argb_to_rgb565(const uint32_t *src, uint16_t *dst, int count)
@@ -496,9 +507,8 @@ static void stream_play(struct stream *s, void *fb, int once)
             if (final || quit)
                 break;
 
-            struct timespec next;
-            clock_gettime(CLOCK_MONOTONIC, &next);
-            timespec_add_ms(&next, s->h.interval_ms);
+            struct timespec next = run_start;
+            timespec_add_ms(&next, (long)(idx + 1) * s->h.interval_ms);
             sleep_until(&next);
         }
 
