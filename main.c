@@ -290,8 +290,9 @@ static void sleep_until(struct timespec *next)
 
 static void timespec_add_ms(struct timespec *ts, long ms)
 {
-    ts->tv_nsec += ms * 1000000L;
-    while (ts->tv_nsec >= 1000000000L) {
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
         ts->tv_sec++;
         ts->tv_nsec -= 1000000000L;
     }
