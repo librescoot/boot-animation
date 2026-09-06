@@ -303,6 +303,8 @@ struct stream {
     uint32_t *clen;      /* compressed length per frame */
     size_t *offset;      /* offset into data of each frame's payload */
     uint16_t *frame;     /* decode scratch, one frame */
+    uint32_t *lut;       /* RGB565 to XRGB8888, only for 32bpp output */
+    int fb_bpp;
 };
 
 static void stream_free(struct stream *s)
@@ -313,6 +315,7 @@ static void stream_free(struct stream *s)
     free(s->clen);
     free(s->offset);
     free(s->frame);
+    free(s->lut);
     free(s);
 }
 
@@ -355,7 +358,8 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
         goto fail;
     }
 
-    if ((int)s->h.width != width || (int)s->h.height != height || bpp != 16) {
+    if ((int)s->h.width != width || (int)s->h.height != height ||
+        (bpp != 16 && bpp != 32)) {
         fprintf(stderr, "%s: %ux%u RGB565 does not match fb0 %dx%d %dbpp\n",
                 path, s->h.width, s->h.height, width, height, bpp);
         goto fail;
@@ -381,8 +385,23 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
     s->clen = malloc(s->h.frame_count * sizeof(*s->clen));
     s->offset = malloc(s->h.frame_count * sizeof(*s->offset));
     s->frame = malloc((size_t)width * height * 2);
+    s->fb_bpp = bpp;
     if (!s->clen || !s->offset || !s->frame)
         goto fail;
+
+    if (bpp == 32) {
+        s->lut = malloc(65536 * sizeof(*s->lut));
+        if (!s->lut)
+            goto fail;
+        for (uint32_t px = 0; px < 65536; px++) {
+            uint32_t r = (px >> 11) & 0x1f;
+            uint32_t g = (px >> 5) & 0x3f;
+            uint32_t b = px & 0x1f;
+            s->lut[px] = (((r << 3) | (r >> 2)) << 16) |
+                         (((g << 2) | (g >> 4)) << 8) |
+                         ((b << 3) | (b >> 2));
+        }
+    }
 
     size_t off = 0;
     for (uint32_t i = 0; i < s->h.frame_count; i++) {
@@ -396,9 +415,10 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
         off += s->clen[i];
     }
 
-    fprintf(stderr, "stream %s: %u frames, %ums interval%s\n",
+    fprintf(stderr, "stream %s: %u frames, %ums interval%s%s\n",
             path, s->h.frame_count, s->h.interval_ms,
-            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "");
+            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "",
+            bpp == 32 ? ", expanding to 32bpp" : "");
     return s;
 
 truncated:
@@ -410,17 +430,32 @@ fail:
     return NULL;
 }
 
-/* Decode one frame into scratch and push it to the panel. */
-static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_bytes)
+static void stream_copy_to_fb(const struct stream *s, const uint16_t *src,
+                              void *fb, int pixels)
 {
-    uLongf out_len = frame_bytes;
+    if (s->fb_bpp == 16) {
+        memcpy(fb, src, (size_t)pixels * 2);
+        return;
+    }
+
+    uint32_t *dst = fb;
+    for (int i = 0; i < pixels; i++)
+        dst[i] = s->lut[src[i]];
+}
+
+/* Decode one frame into scratch and push it to the panel. */
+static int stream_show(struct stream *s, uint32_t idx, void *fb)
+{
+    const size_t source_bytes = (size_t)s->h.width * s->h.height * 2;
+    uLongf out_len = source_bytes;
     int rc = uncompress((Bytef *)s->frame, &out_len,
                         s->data + s->offset[idx], s->clen[idx]);
-    if (rc != Z_OK || out_len != frame_bytes) {
+    if (rc != Z_OK || out_len != source_bytes) {
         fprintf(stderr, "frame %u: uncompress failed (%d)\n", idx, rc);
         return -1;
     }
-    memcpy(fb, s->frame, frame_bytes);
+    stream_copy_to_fb(s, s->frame, fb,
+                      (int)(s->h.width * s->h.height));
     return 0;
 }
 
@@ -431,7 +466,7 @@ static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_by
  * are what make the skip free. Leaves the last shown frame in s->frame for
  * the caller to fade out.
  */
-static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once)
+static void stream_play(struct stream *s, void *fb, int once)
 {
     const uint32_t last = s->h.frame_count - 1;
     int notified = 0;
@@ -449,7 +484,7 @@ static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once
                 idx = last;
 
             if (idx != shown) {
-                if (stream_show(s, idx, fb, frame_bytes) < 0)
+                if (stream_show(s, idx, fb) < 0)
                     return;
                 shown = idx;
                 if (!notified) {
@@ -474,7 +509,7 @@ static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once
 
 /* Fade the frame we ended on down to black, then clear. */
 static void stream_fade_out(struct stream *s, void *fb, int width, int height,
-                            int fade_ms, size_t fb_size)
+                            int bpp, int fade_ms, size_t fb_size)
 {
     if (fade_ms > 0) {
         long frame_ms = s->h.interval_ms;
@@ -490,14 +525,14 @@ static void stream_fade_out(struct stream *s, void *fb, int width, int height,
             clock_gettime(CLOCK_MONOTONIC, &next);
             for (int step = 1; step <= steps && !quit; step++) {
                 float alpha = 1.0f - (float)step / steps;
-                uint16_t *dst = fb;
                 for (int i = 0; i < width * height; i++) {
                     uint16_t px = last[i];
-                    uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * alpha);
-                    uint8_t g = (uint8_t)(((px >>  5) & 0x3F) * alpha);
-                    uint8_t b = (uint8_t)(( px        & 0x1F) * alpha);
-                    dst[i] = (r << 11) | (g << 5) | b;
+                    uint16_t r = (uint16_t)(((px >> 11) & 0x1F) * alpha);
+                    uint16_t g = (uint16_t)(((px >>  5) & 0x3F) * alpha);
+                    uint16_t b = (uint16_t)(( px        & 0x1F) * alpha);
+                    s->frame[i] = (uint16_t)((r << 11) | (g << 5) | b);
                 }
+                stream_copy_to_fb(s, s->frame, fb, width * height);
                 timespec_add_ms(&next, frame_ms);
                 sleep_until(&next);
             }
@@ -589,9 +624,7 @@ int main(int argc, char *argv[])
      */
     struct stream *stream = stream_load(lottie_path, width, height, bpp);
     if (stream) {
-        const size_t frame_bytes = (size_t)width * height * 2;
-
-        stream_play(stream, fb_mmap, frame_bytes, once);
+        stream_play(stream, fb_mmap, once);
 
         if (once && !quit) {
             fprintf(stderr, "holding last frame until SIGTERM\n");
@@ -600,7 +633,7 @@ int main(int argc, char *argv[])
         }
 
         quit = 0;
-        stream_fade_out(stream, fb_mmap, width, height, fade_ms, fb_size);
+        stream_fade_out(stream, fb_mmap, width, height, bpp, fade_ms, fb_size);
 
         stream_free(stream);
         audio_stop = 1;
