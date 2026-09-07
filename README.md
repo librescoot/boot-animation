@@ -19,6 +19,7 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 - [ThorVG](https://github.com/thorvg/thorvg) with C API bindings (`-lthorvg`)
 - zlib (`-lz`)
+- ALSA library (`-lasound`)
 - `libc`, `libstdc++`, `libm`, `libpthread`
 
 ThorVG must be built with Lottie support enabled.
@@ -42,9 +43,10 @@ bin/lottie2stream windowsxp.json 480 480 25 windowsxp.lsba --loop
 
 At runtime, given `foo.json`, the player looks for `foo.lsba` beside it and uses
 it when the geometry matches the framebuffer. A stream can also be passed
-directly. Anything else — no stream, a different panel size, a framebuffer that
-is not 16bpp, a malformed file — falls back to rendering the JSON live, so a
-splash always appears.
+directly. RGB565 frames are copied directly to a 16bpp framebuffer or expanded
+to XRGB8888 while copying to a 32bpp framebuffer. Anything else — no stream, a
+different panel size, an unsupported framebuffer, a malformed file — falls back
+to rendering the JSON live, so a splash always appears.
 
 Streams are RGB565 with each frame compressed independently. That costs almost
 nothing in size against compressing the whole sequence, and it keeps runtime
@@ -81,7 +83,7 @@ The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs tho
 ## Usage
 
 ```
-boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
+boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]
 ```
 
 | Option | Default | Description |
@@ -90,6 +92,13 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
 | `--fps N` | animation's native FPS | Target render frame rate; also used if the animation reports zero duration |
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
+| `--sound WAV` | off | Play a stereo 48 kHz 16-bit PCM WAV through ALSA while the animation starts |
+| `--audio-device PCM` | `auto` | ALSA PCM name; auto prefers TAS5720, then USB, then another output |
+
+Audio is best-effort: a separate worker waits up to 15 seconds for the selected
+output to become usable, covering sound cards that register late during boot. Missing
+devices, unsupported formats, timeouts, and playback errors never delay the animation.
+Runtime audio-device hotplug after that startup window is not monitored.
 
 ### Exit behaviour
 
@@ -126,7 +135,7 @@ The service is `Type=notify` and runs in `sysinit.target` before `multi-user.tar
 ## Framebuffer Notes
 
 - When rasterising live, the renderer works in ARGB8888 internally (ThorVG requirement), and each frame is converted to RGB565 before writing to a 16bpp framebuffer.
-- Streams are already RGB565, so playback is a decompress straight into the framebuffer. They are therefore 16bpp only; a 32bpp panel rasterises live.
+- Streams are RGB565. Playback copies them directly to 16bpp or expands them to XRGB8888 for a 32bpp framebuffer.
 - The animation is scaled uniformly (letterboxed) to fit the display dimensions reported by `FBIOGET_VSCREENINFO`.
 
 ## License

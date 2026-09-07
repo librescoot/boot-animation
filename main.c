@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 /*
  * boot-animation: Lottie animation renderer for /dev/fb0
  *
@@ -21,17 +23,233 @@
 #include <sys/un.h>
 #include <linux/fb.h>
 #include <limits.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <alsa/asoundlib.h>
 #include <zlib.h>
 #include <thorvg_capi.h>
 
 #include "stream.h"
 
 static volatile sig_atomic_t quit = 0;
+static volatile sig_atomic_t audio_stop = 0;
 
 static void handle_signal(int sig)
 {
     (void)sig;
     quit = 1;
+}
+
+struct audio_playback {
+    const char *path;
+    const char *configured_device;
+    pthread_t thread;
+    int started;
+};
+
+static char *select_audio_device(const char *configured)
+{
+    if (configured && configured[0] && strcmp(configured, "auto") != 0)
+        return strdup(configured);
+
+    void **hints = NULL;
+    char *builtin = NULL;
+    char *usb = NULL;
+    char *fallback = NULL;
+    if (snd_device_name_hint(-1, "pcm", &hints) < 0)
+        return NULL;
+
+    for (void **hint = hints; *hint; hint++) {
+        char *name = snd_device_name_get_hint(*hint, "NAME");
+        char *desc = snd_device_name_get_hint(*hint, "DESC");
+        char *io = snd_device_name_get_hint(*hint, "IOID");
+        int output = !io || strcmp(io, "Input") != 0;
+        if (output && name) {
+            if (!fallback && strcmp(name, "null") != 0)
+                fallback = strdup(name);
+            if (!builtin && (strcasestr(name, "tas5720") ||
+                             (desc && strcasestr(desc, "tas5720"))))
+                builtin = strdup(name);
+            if (!usb && (strcasestr(name, "usb") ||
+                         (desc && strcasestr(desc, "usb"))))
+                usb = strdup(name);
+        }
+        free(name);
+        free(desc);
+        free(io);
+    }
+    snd_device_name_free_hint(hints);
+
+    char *selected = builtin ? builtin : (usb ? usb : fallback);
+    if (selected != builtin)
+        free(builtin);
+    if (selected != usb)
+        free(usb);
+    if (selected != fallback)
+        free(fallback);
+    return selected;
+}
+
+static int audio_timed_out(const struct timespec *deadline)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec > deadline->tv_sec ||
+           (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
+}
+
+static uint16_t read_le16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t read_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void *play_wav(void *arg)
+{
+    struct audio_playback *audio = arg;
+    const char *path = audio->path;
+    int fd = -1;
+    uint8_t *file = MAP_FAILED;
+    snd_pcm_t *pcm = NULL;
+    char *device = NULL;
+    struct stat st;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 44)
+        goto done;
+
+    file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED)
+        goto done;
+    if (memcmp(file, "RIFF", 4) != 0 || memcmp(file + 8, "WAVE", 4) != 0)
+        goto invalid;
+
+    const uint8_t *fmt = NULL;
+    const uint8_t *data = NULL;
+    uint32_t fmt_size = 0;
+    uint32_t data_size = 0;
+    size_t offset = 12;
+    while (offset + 8 <= (size_t)st.st_size) {
+        uint32_t size = read_le32(file + offset + 4);
+        size_t payload = offset + 8;
+        if (payload + size > (size_t)st.st_size)
+            goto invalid;
+        if (memcmp(file + offset, "fmt ", 4) == 0) {
+            fmt = file + payload;
+            fmt_size = size;
+        } else if (memcmp(file + offset, "data", 4) == 0) {
+            data = file + payload;
+            data_size = size;
+        }
+        offset = payload + size + (size & 1u);
+    }
+
+    if (!fmt || fmt_size < 16 || !data || read_le16(fmt) != 1 ||
+        read_le16(fmt + 2) != 2 || read_le32(fmt + 4) != 48000 ||
+        read_le16(fmt + 14) != 16) {
+invalid:
+        fprintf(stderr, "%s: expected 48 kHz stereo 16-bit PCM WAV\n", path);
+        goto done;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += 15;
+
+    int err = -ENODEV;
+    while (!audio_stop && !audio_timed_out(&deadline)) {
+        device = select_audio_device(audio->configured_device);
+        if (device) {
+            err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK,
+                               SND_PCM_NONBLOCK);
+            if (err >= 0) {
+                err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
+                                         SND_PCM_ACCESS_RW_INTERLEAVED,
+                                         2, 48000, 1, 200000);
+                if (err >= 0)
+                    break;
+                snd_pcm_close(pcm);
+                pcm = NULL;
+            }
+            free(device);
+            device = NULL;
+        }
+        struct timespec retry = { .tv_sec = 0, .tv_nsec = 250000000L };
+        nanosleep(&retry, NULL);
+    }
+    if (!pcm) {
+        if (!audio_stop)
+            fprintf(stderr, "startup audio disabled: no usable output after 15s\n");
+        goto done;
+    }
+    fprintf(stderr, "startup audio: using %s\n", device);
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += data_size / 192000 + 3;
+
+    const uint8_t *cursor = data;
+    snd_pcm_uframes_t frames = data_size / 4;
+    while (frames > 0 && !audio_stop && !audio_timed_out(&deadline)) {
+        snd_pcm_sframes_t written = snd_pcm_writei(pcm, cursor, frames);
+        if (written == -EAGAIN) {
+            snd_pcm_wait(pcm, 100);
+            continue;
+        }
+        if (written < 0) {
+            int recovered = snd_pcm_recover(pcm, (int)written, 1);
+            if (recovered >= 0)
+                continue;
+            fprintf(stderr, "startup audio disabled: %s\n", snd_strerror(recovered));
+            break;
+        }
+        cursor += (size_t)written * 4;
+        frames -= (snd_pcm_uframes_t)written;
+    }
+
+    if (frames == 0 && !audio_stop) {
+        while ((err = snd_pcm_drain(pcm)) == -EAGAIN &&
+               !audio_timed_out(&deadline))
+            snd_pcm_wait(pcm, 100);
+    }
+    if (frames > 0 || err < 0 || audio_stop)
+        snd_pcm_drop(pcm);
+
+done:
+    if (pcm)
+        snd_pcm_close(pcm);
+    free(device);
+    if (file != MAP_FAILED)
+        munmap(file, (size_t)st.st_size);
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+static void audio_start(struct audio_playback *audio, const char *path,
+                        const char *configured_device)
+{
+    if (!path)
+        return;
+    audio->path = path;
+    audio->configured_device = configured_device;
+    if (pthread_create(&audio->thread, NULL, play_wav, audio) == 0) {
+        audio->started = 1;
+    } else {
+        fprintf(stderr, "startup audio disabled: failed to create playback thread\n");
+    }
+}
+
+static void audio_join(struct audio_playback *audio)
+{
+    if (audio->started) {
+        pthread_join(audio->thread, NULL);
+        audio->started = 0;
+    }
 }
 
 static void argb_to_rgb565(const uint32_t *src, uint16_t *dst, int count)
@@ -72,8 +290,9 @@ static void sleep_until(struct timespec *next)
 
 static void timespec_add_ms(struct timespec *ts, long ms)
 {
-    ts->tv_nsec += ms * 1000000L;
-    while (ts->tv_nsec >= 1000000000L) {
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
         ts->tv_sec++;
         ts->tv_nsec -= 1000000000L;
     }
@@ -96,6 +315,8 @@ struct stream {
     uint32_t *clen;      /* compressed length per frame */
     size_t *offset;      /* offset into data of each frame's payload */
     uint16_t *frame;     /* decode scratch, one frame */
+    uint32_t *lut;       /* RGB565 to XRGB8888, only for 32bpp output */
+    int fb_bpp;
 };
 
 static void stream_free(struct stream *s)
@@ -106,6 +327,7 @@ static void stream_free(struct stream *s)
     free(s->clen);
     free(s->offset);
     free(s->frame);
+    free(s->lut);
     free(s);
 }
 
@@ -148,7 +370,8 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
         goto fail;
     }
 
-    if ((int)s->h.width != width || (int)s->h.height != height || bpp != 16) {
+    if ((int)s->h.width != width || (int)s->h.height != height ||
+        (bpp != 16 && bpp != 32)) {
         fprintf(stderr, "%s: %ux%u RGB565 does not match fb0 %dx%d %dbpp\n",
                 path, s->h.width, s->h.height, width, height, bpp);
         goto fail;
@@ -174,8 +397,23 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
     s->clen = malloc(s->h.frame_count * sizeof(*s->clen));
     s->offset = malloc(s->h.frame_count * sizeof(*s->offset));
     s->frame = malloc((size_t)width * height * 2);
+    s->fb_bpp = bpp;
     if (!s->clen || !s->offset || !s->frame)
         goto fail;
+
+    if (bpp == 32) {
+        s->lut = malloc(65536 * sizeof(*s->lut));
+        if (!s->lut)
+            goto fail;
+        for (uint32_t px = 0; px < 65536; px++) {
+            uint32_t r = (px >> 11) & 0x1f;
+            uint32_t g = (px >> 5) & 0x3f;
+            uint32_t b = px & 0x1f;
+            s->lut[px] = (((r << 3) | (r >> 2)) << 16) |
+                         (((g << 2) | (g >> 4)) << 8) |
+                         ((b << 3) | (b >> 2));
+        }
+    }
 
     size_t off = 0;
     for (uint32_t i = 0; i < s->h.frame_count; i++) {
@@ -189,9 +427,10 @@ static struct stream *stream_load(const char *lottie_path, int width, int height
         off += s->clen[i];
     }
 
-    fprintf(stderr, "stream %s: %u frames, %ums interval%s\n",
+    fprintf(stderr, "stream %s: %u frames, %ums interval%s%s\n",
             path, s->h.frame_count, s->h.interval_ms,
-            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "");
+            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "",
+            bpp == 32 ? ", expanding to 32bpp" : "");
     return s;
 
 truncated:
@@ -203,17 +442,32 @@ fail:
     return NULL;
 }
 
-/* Decode one frame into scratch and push it to the panel. */
-static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_bytes)
+static void stream_copy_to_fb(const struct stream *s, const uint16_t *src,
+                              void *fb, int pixels)
 {
-    uLongf out_len = frame_bytes;
+    if (s->fb_bpp == 16) {
+        memcpy(fb, src, (size_t)pixels * 2);
+        return;
+    }
+
+    uint32_t *dst = fb;
+    for (int i = 0; i < pixels; i++)
+        dst[i] = s->lut[src[i]];
+}
+
+/* Decode one frame into scratch and push it to the panel. */
+static int stream_show(struct stream *s, uint32_t idx, void *fb)
+{
+    const size_t source_bytes = (size_t)s->h.width * s->h.height * 2;
+    uLongf out_len = source_bytes;
     int rc = uncompress((Bytef *)s->frame, &out_len,
                         s->data + s->offset[idx], s->clen[idx]);
-    if (rc != Z_OK || out_len != frame_bytes) {
+    if (rc != Z_OK || out_len != source_bytes) {
         fprintf(stderr, "frame %u: uncompress failed (%d)\n", idx, rc);
         return -1;
     }
-    memcpy(fb, s->frame, frame_bytes);
+    stream_copy_to_fb(s, s->frame, fb,
+                      (int)(s->h.width * s->h.height));
     return 0;
 }
 
@@ -224,7 +478,7 @@ static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_by
  * are what make the skip free. Leaves the last shown frame in s->frame for
  * the caller to fade out.
  */
-static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once)
+static void stream_play(struct stream *s, void *fb, int once)
 {
     const uint32_t last = s->h.frame_count - 1;
     int notified = 0;
@@ -242,7 +496,7 @@ static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once
                 idx = last;
 
             if (idx != shown) {
-                if (stream_show(s, idx, fb, frame_bytes) < 0)
+                if (stream_show(s, idx, fb) < 0)
                     return;
                 shown = idx;
                 if (!notified) {
@@ -254,9 +508,8 @@ static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once
             if (final || quit)
                 break;
 
-            struct timespec next;
-            clock_gettime(CLOCK_MONOTONIC, &next);
-            timespec_add_ms(&next, s->h.interval_ms);
+            struct timespec next = run_start;
+            timespec_add_ms(&next, (long)(idx + 1) * s->h.interval_ms);
             sleep_until(&next);
         }
 
@@ -267,7 +520,7 @@ static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once
 
 /* Fade the frame we ended on down to black, then clear. */
 static void stream_fade_out(struct stream *s, void *fb, int width, int height,
-                            int fade_ms, size_t fb_size)
+                            int bpp, int fade_ms, size_t fb_size)
 {
     if (fade_ms > 0) {
         long frame_ms = s->h.interval_ms;
@@ -283,14 +536,14 @@ static void stream_fade_out(struct stream *s, void *fb, int width, int height,
             clock_gettime(CLOCK_MONOTONIC, &next);
             for (int step = 1; step <= steps && !quit; step++) {
                 float alpha = 1.0f - (float)step / steps;
-                uint16_t *dst = fb;
                 for (int i = 0; i < width * height; i++) {
                     uint16_t px = last[i];
-                    uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * alpha);
-                    uint8_t g = (uint8_t)(((px >>  5) & 0x3F) * alpha);
-                    uint8_t b = (uint8_t)(( px        & 0x1F) * alpha);
-                    dst[i] = (r << 11) | (g << 5) | b;
+                    uint16_t r = (uint16_t)(((px >> 11) & 0x1F) * alpha);
+                    uint16_t g = (uint16_t)(((px >>  5) & 0x3F) * alpha);
+                    uint16_t b = (uint16_t)(( px        & 0x1F) * alpha);
+                    s->frame[i] = (uint16_t)((r << 11) | (g << 5) | b);
                 }
+                stream_copy_to_fb(s, s->frame, fb, width * height);
                 timespec_add_ms(&next, frame_ms);
                 sleep_until(&next);
             }
@@ -307,6 +560,9 @@ int main(int argc, char *argv[])
     int target_fps = 0;
     int fade_ms = 1000;
     int once = 0;
+    const char *sound_path = NULL;
+    const char *audio_device = "auto";
+    struct audio_playback audio = {0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
@@ -315,13 +571,17 @@ int main(int argc, char *argv[])
             fade_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--once") == 0) {
             once = 1;
+        } else if (strcmp(argv[i], "--sound") == 0 && i + 1 < argc) {
+            sound_path = argv[++i];
+        } else if (strcmp(argv[i], "--audio-device") == 0 && i + 1 < argc) {
+            audio_device = argv[++i];
         } else if (argv[i][0] != '-') {
             lottie_path = argv[i];
         }
     }
 
     if (!lottie_path) {
-        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]\n");
+        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]\n");
         return 1;
     }
 
@@ -364,6 +624,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    audio_start(&audio, sound_path, audio_device);
+
     /*
      * Prefer a prerendered stream. Rasterising Lottie costs more per frame
      * than the frame budget on the DBC, which both stretches the animation
@@ -373,9 +635,7 @@ int main(int argc, char *argv[])
      */
     struct stream *stream = stream_load(lottie_path, width, height, bpp);
     if (stream) {
-        const size_t frame_bytes = (size_t)width * height * 2;
-
-        stream_play(stream, fb_mmap, frame_bytes, once);
+        stream_play(stream, fb_mmap, once);
 
         if (once && !quit) {
             fprintf(stderr, "holding last frame until SIGTERM\n");
@@ -384,9 +644,11 @@ int main(int argc, char *argv[])
         }
 
         quit = 0;
-        stream_fade_out(stream, fb_mmap, width, height, fade_ms, fb_size);
+        stream_fade_out(stream, fb_mmap, width, height, bpp, fade_ms, fb_size);
 
         stream_free(stream);
+        audio_stop = 1;
+        audio_join(&audio);
         munmap(fb_mmap, fb_size);
         close(fb_fd);
         return 0;
@@ -579,6 +841,8 @@ cleanup_canvas:
 cleanup_engine:
     tvg_engine_term();
 cleanup_fb:
+    audio_stop = 1;
+    audio_join(&audio);
     munmap(fb_mmap, fb_size);
     close(fb_fd);
 
