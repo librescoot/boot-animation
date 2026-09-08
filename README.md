@@ -8,11 +8,11 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 - Plays prerendered frame streams, falling back to rasterising Lottie live
 - Software-rendered Lottie animation via ThorVG (no GPU required)
-- Supports 16bpp (RGB565) and 32bpp (ARGB8888) framebuffers
+- Supports RGB565 and XRGB8888/ARGB8888 framebuffers, including padded row strides
 - Scales animation proportionally to fit display resolution
 - Loops indefinitely by default; `--once` plays once then holds the last frame
 - Fade-to-black on exit (driven by SIGTERM)
-- `sd_notify` integration (signals `READY=1` after the first loop completes)
+- `sd_notify` integration (signals `READY=1` after the first displayed frame)
 - Animation selectable via kernel command line (`boot.animation=name`)
 
 ## Dependencies
@@ -42,15 +42,24 @@ bin/lottie2stream windowsxp.json 480 480 25 windowsxp.lsba --loop
 
 At runtime, given `foo.json`, the player looks for `foo.lsba` beside it and uses
 it when the geometry matches the framebuffer. A stream can also be passed
-directly. Anything else — no stream, a different panel size, a framebuffer that
-is not 16bpp, a malformed file — falls back to rendering the JSON live, so a
-splash always appears.
+directly; if it fails, the player tries the sibling `foo.json`, never the binary
+stream itself, as the live source. RGB565 stream rows are copied to RGB565
+framebuffers or expanded to XRGB8888/ARGB8888 while copying. Missing, malformed,
+truncated, or mismatched streams fall back to rendering the JSON live. If both
+paths fail, the last valid framebuffer contents are preserved and the process
+exits unsuccessfully.
 
 Streams are RGB565 with each frame compressed independently. That costs almost
 nothing in size against compressing the whole sequence, and it keeps runtime
 memory at a single frame while letting playback skip ahead when a decode
 overruns its slot. For reference, 480×480 at 25 fps: 2.5 MiB for an 8 s
 animation, 0.4 MiB for a 2 s loop.
+
+For boot-time resource safety, the reader rejects streams with more than 4096
+frames, a total duration beyond `UINT32_MAX` milliseconds (about 49 days), or
+more than 16 MiB of payload. Each compressed frame must also fit a conservative
+zlib compression bound derived from its uncompressed RGB565 size.
+These operational maxima are comfortably above the shipped streams.
 
 ## Building
 
@@ -78,6 +87,21 @@ make build-host
 
 The Yocto recipe in `meta-librescoot` builds via `pkg-config --cflags/--libs thorvg-1` and installs the binary to `/usr/bin/boot-animation`. It also builds `lottie2stream` against `thorvg-native` and packs a stream for each shipped animation into `/usr/share/boot-animation/`.
 
+### Host tests
+
+The dependency-free rendering, timing, and stream-validation tests do not need
+ThorVG:
+
+```sh
+make test
+```
+
+They cover RGB565 and 32-bit conversion with padded framebuffer strides,
+framebuffer bounds checks, absolute deadline arithmetic, playback/fade
+boundaries, fallback path derivation, and malformed or oversized streams.
+Caller-supplied `CPPFLAGS`, `CFLAGS`, and `LDFLAGS` are honored, including for
+sanitizer builds through this target.
+
 ## Usage
 
 ```
@@ -104,7 +128,7 @@ A second SIGTERM during the fade aborts it immediately and exits.
 
 ### sd_notify
 
-When run as a `Type=notify` systemd service, `boot-animation` sends `READY=1` via the `NOTIFY_SOCKET` after the first full animation loop completes. This lets downstream units (`dbc-dispatcher`, etc.) wait until at least one frame cycle has been displayed before starting.
+When run as a `Type=notify` systemd service, `boot-animation` sends `READY=1` via the `NOTIFY_SOCKET` after the first frame has been copied to the framebuffer. This lets downstream units (`dbc-dispatcher`, etc.) start only after a splash frame is visible.
 
 ### Kernel command line
 
@@ -125,9 +149,18 @@ The service is `Type=notify` and runs in `sysinit.target` before `multi-user.tar
 
 ## Framebuffer Notes
 
-- When rasterising live, the renderer works in ARGB8888 internally (ThorVG requirement), and each frame is converted to RGB565 before writing to a 16bpp framebuffer.
-- Streams are already RGB565, so playback is a decompress straight into the framebuffer. They are therefore 16bpp only; a 32bpp panel rasterises live.
-- The animation is scaled uniformly (letterboxed) to fit the display dimensions reported by `FBIOGET_VSCREENINFO`.
+- The player accepts RGB565 (`R5:G6:B5`) and 32-bit `R8:G8:B8` layouts with either an unused high byte (XRGB8888) or 8-bit alpha (ARGB8888). Other bitfield layouts are rejected before rendering.
+- Copies honor `finfo.line_length`, visible offsets, virtual geometry, and mapped-memory bounds; row padding and non-visible framebuffer memory are left untouched.
+- When rasterising live, ThorVG renders ARGB8888 internally and the player converts each visible row as needed. RGB565 streams are copied row by row or expanded to the selected 32-bit layout.
+- Playback, live rendering, and fades use monotonic absolute deadlines. Late work skips obsolete frame or fade slots instead of extending the animation.
+- The animation is scaled uniformly (letterboxed) to fit the visible display dimensions reported by `FBIOGET_VSCREENINFO`.
+
+## Diagnostics
+
+Startup logs identify the framebuffer layout and whether stream or live mode was
+selected. One bounded summary is emitted at shutdown with the fallback reason,
+shown and skipped animation/fade frames, missed deadlines, and maximum observed
+lateness. Per-frame diagnostics are not emitted.
 
 ## License
 

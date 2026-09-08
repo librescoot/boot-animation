@@ -7,51 +7,63 @@
  * Usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
  */
 
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <linux/fb.h>
+#include <math.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <signal.h>
-#include <time.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <linux/fb.h>
-#include <limits.h>
+#include <time.h>
+#include <unistd.h>
 #include <zlib.h>
 #include <thorvg_capi.h>
 
+#include "render_utils.h"
+#include "signal_utils.h"
 #include "stream.h"
 
-static volatile sig_atomic_t quit = 0;
+static volatile sig_atomic_t stop_signals = 0;
+
+struct run_stats {
+    uint64_t frames_shown;
+    uint64_t frames_skipped;
+    uint64_t fade_frames_shown;
+    uint64_t fade_frames_skipped;
+    uint64_t missed_deadlines;
+    uint64_t max_lateness_ms;
+    uint64_t last_slot;
+    uint64_t last_fade_slot;
+    int have_slot;
+    int have_fade_slot;
+};
 
 static void handle_signal(int sig)
 {
     (void)sig;
-    quit = 1;
-}
-
-static void argb_to_rgb565(const uint32_t *src, uint16_t *dst, int count)
-{
-    for (int i = 0; i < count; i++) {
-        uint32_t px = src[i];
-        uint8_t r = (px >> 16) & 0xFF;
-        uint8_t g = (px >>  8) & 0xFF;
-        uint8_t b =  px        & 0xFF;
-        dst[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-    }
+    if (stop_signals < SIG_ATOMIC_MAX)
+        stop_signals++;
 }
 
 static void sd_notify_ready(void)
 {
     const char *sock_path = getenv("NOTIFY_SOCKET");
-    if (!sock_path) return;
+    if (!sock_path)
+        return;
 
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) return;
+    if (fd < 0)
+        return;
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
@@ -64,27 +76,53 @@ static void sd_notify_ready(void)
     fprintf(stderr, "sd_notify: READY=1\n");
 }
 
-static void sleep_until(struct timespec *next)
+static void sleep_until(const struct timespec *deadline)
 {
-    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next, NULL) != 0)
-        ;
-}
-
-static void timespec_add_ms(struct timespec *ts, long ms)
-{
-    ts->tv_nsec += ms * 1000000L;
-    while (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec++;
-        ts->tv_nsec -= 1000000000L;
+    while (!stop_signals) {
+        int result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                     deadline, NULL);
+        if (result == 0 || result != EINTR)
+            return;
     }
 }
 
-static long elapsed_ms(const struct timespec *since)
+static uint64_t elapsed_since(const struct timespec *start)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - since->tv_sec) * 1000L +
-           (now.tv_nsec - since->tv_nsec) / 1000000L;
+    return timespec_elapsed_ms(start, &now);
+}
+
+static void stats_start_run(struct run_stats *stats)
+{
+    stats->have_slot = 0;
+}
+
+static void stats_note(struct run_stats *stats, uint64_t slot,
+                       uint64_t displayed_ms, uint64_t deadline_ms,
+                       uint32_t budget_ms, int fade)
+{
+    uint64_t *shown = fade ? &stats->fade_frames_shown : &stats->frames_shown;
+    uint64_t *skipped = fade ? &stats->fade_frames_skipped : &stats->frames_skipped;
+    uint64_t *last = fade ? &stats->last_fade_slot : &stats->last_slot;
+    int *have = fade ? &stats->have_fade_slot : &stats->have_slot;
+
+    if (*have) {
+        if (slot > *last + 1)
+            *skipped += slot - *last - 1;
+    } else if (slot > 0) {
+        *skipped += slot;
+    }
+    *last = slot;
+    *have = 1;
+    (*shown)++;
+
+    uint64_t lateness = displayed_ms > deadline_ms ?
+                        displayed_ms - deadline_ms : 0;
+    if (lateness > stats->max_lateness_ms)
+        stats->max_lateness_ms = lateness;
+    if (budget_ms > 0 && lateness >= budget_ms)
+        stats->missed_deadlines++;
 }
 
 /* ---------------------------------------------------------------- streams */
@@ -93,212 +131,575 @@ struct stream {
     uint8_t *data;
     size_t size;
     struct stream_header h;
-    uint32_t *clen;      /* compressed length per frame */
-    size_t *offset;      /* offset into data of each frame's payload */
-    uint16_t *frame;     /* decode scratch, one frame */
+    uint32_t *clen;
+    size_t *offset;
+    uint16_t *frame;
+    uint32_t *lut;
+    int has_frame;
 };
 
-static void stream_free(struct stream *s)
+static void stream_free(struct stream *stream)
 {
-    if (!s)
+    if (!stream)
         return;
-    free(s->data);
-    free(s->clen);
-    free(s->offset);
-    free(s->frame);
-    free(s);
+    free(stream->data);
+    free(stream->clen);
+    free(stream->offset);
+    free(stream->frame);
+    free(stream->lut);
+    free(stream);
 }
 
-/*
- * Load <lottie>.lsba, or the given path if it already is one. Returns NULL
- * whenever the stream is missing, malformed, or does not match the panel we
- * opened, so every failure lands on live rasterising rather than a blank
- * screen.
- */
-static struct stream *stream_load(const char *lottie_path, int width, int height, int bpp)
+static int size_product(size_t left, size_t right, size_t *result)
 {
-    char path[PATH_MAX];
-    const char *dot = strrchr(lottie_path, '.');
-
-    if (dot && strcmp(dot, ".lsba") == 0) {
-        snprintf(path, sizeof(path), "%s", lottie_path);
-    } else {
-        size_t stem = dot ? (size_t)(dot - lottie_path) : strlen(lottie_path);
-        if (stem + sizeof(".lsba") > sizeof(path))
-            return NULL;
-        snprintf(path, sizeof(path), "%.*s.lsba", (int)stem, lottie_path);
-    }
-
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return NULL;
-
-    struct stream *s = calloc(1, sizeof(*s));
-    if (!s) {
-        fclose(f);
-        return NULL;
-    }
-
-    if (fread(&s->h, sizeof(s->h), 1, f) != 1 ||
-        memcmp(s->h.magic, STREAM_MAGIC, 4) != 0 ||
-        s->h.version != STREAM_VERSION ||
-        s->h.format != STREAM_FMT_RGB565LE ||
-        s->h.frame_count == 0 || s->h.interval_ms == 0) {
-        fprintf(stderr, "%s: not a usable stream\n", path);
-        goto fail;
-    }
-
-    if ((int)s->h.width != width || (int)s->h.height != height || bpp != 16) {
-        fprintf(stderr, "%s: %ux%u RGB565 does not match fb0 %dx%d %dbpp\n",
-                path, s->h.width, s->h.height, width, height, bpp);
-        goto fail;
-    }
-
-    long start = ftell(f);
-    if (fseek(f, 0, SEEK_END) != 0)
-        goto fail;
-    s->size = (size_t)(ftell(f) - start);
-    if (fseek(f, start, SEEK_SET) != 0)
-        goto fail;
-
-    s->data = malloc(s->size);
-    if (!s->data || fread(s->data, 1, s->size, f) != s->size) {
-        fprintf(stderr, "%s: short read\n", path);
-        goto fail;
-    }
-    fclose(f);
-    f = NULL;
-
-    /* Walk the length prefixes to index the frames. No decompression, so this
-       stays cheap even for a long animation. */
-    s->clen = malloc(s->h.frame_count * sizeof(*s->clen));
-    s->offset = malloc(s->h.frame_count * sizeof(*s->offset));
-    s->frame = malloc((size_t)width * height * 2);
-    if (!s->clen || !s->offset || !s->frame)
-        goto fail;
-
-    size_t off = 0;
-    for (uint32_t i = 0; i < s->h.frame_count; i++) {
-        if (off + 4 > s->size)
-            goto truncated;
-        memcpy(&s->clen[i], s->data + off, 4);
-        off += 4;
-        if (s->clen[i] == 0 || off + s->clen[i] > s->size)
-            goto truncated;
-        s->offset[i] = off;
-        off += s->clen[i];
-    }
-
-    fprintf(stderr, "stream %s: %u frames, %ums interval%s\n",
-            path, s->h.frame_count, s->h.interval_ms,
-            (s->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "");
-    return s;
-
-truncated:
-    fprintf(stderr, "%s: truncated frame table\n", path);
-fail:
-    if (f)
-        fclose(f);
-    stream_free(s);
-    return NULL;
-}
-
-/* Decode one frame into scratch and push it to the panel. */
-static int stream_show(struct stream *s, uint32_t idx, void *fb, size_t frame_bytes)
-{
-    uLongf out_len = frame_bytes;
-    int rc = uncompress((Bytef *)s->frame, &out_len,
-                        s->data + s->offset[idx], s->clen[idx]);
-    if (rc != Z_OK || out_len != frame_bytes) {
-        fprintf(stderr, "frame %u: uncompress failed (%d)\n", idx, rc);
+    if (right != 0 && left > SIZE_MAX / right)
         return -1;
-    }
-    memcpy(fb, s->frame, frame_bytes);
+    *result = left * right;
     return 0;
 }
 
-/*
- * Play the stream, picking each frame from elapsed wall time. Under boot load
- * a decode can overrun its slot, and skipping ahead keeps the run at its
- * intended length instead of stretching it; independently compressed frames
- * are what make the skip free. Leaves the last shown frame in s->frame for
- * the caller to fade out.
- */
-static void stream_play(struct stream *s, void *fb, size_t frame_bytes, int once)
+/* Every failure is reported to the caller so it can select live rendering. */
+static struct stream *stream_load(const char *lottie_path,
+                                  const struct fb_surface *surface,
+                                  const char **fallback_reason)
 {
-    const uint32_t last = s->h.frame_count - 1;
-    int notified = 0;
+    char path[PATH_MAX];
+    FILE *file = NULL;
+    struct stream *stream = NULL;
 
-    while (!quit) {
+    if (animation_stream_path(path, sizeof(path), lottie_path) < 0) {
+        *fallback_reason = "stream path too long";
+        return NULL;
+    }
+
+    file = fopen(path, "rb");
+    if (!file) {
+        *fallback_reason = errno == ENOENT ? "stream not found" :
+                                             "stream open failed";
+        return NULL;
+    }
+
+    stream = calloc(1, sizeof(*stream));
+    if (!stream) {
+        *fallback_reason = "stream allocation failed";
+        goto fail;
+    }
+
+    if (fread(&stream->h, sizeof(stream->h), 1, file) != 1) {
+        *fallback_reason = "truncated stream header";
+        goto fail;
+    }
+
+    enum stream_validation validation = stream_validate_header(&stream->h);
+    if (validation != STREAM_VALID) {
+        *fallback_reason = stream_validation_name(validation);
+        goto fail;
+    }
+    if (stream->h.width != surface->width ||
+        stream->h.height != surface->height) {
+        *fallback_reason = "stream geometry mismatch";
+        goto fail;
+    }
+
+    size_t frame_pixels;
+    size_t frame_bytes;
+    size_t lengths_bytes;
+    size_t offsets_bytes;
+    if (size_product(surface->width, surface->height, &frame_pixels) < 0 ||
+        size_product(frame_pixels, sizeof(*stream->frame), &frame_bytes) < 0 ||
+        size_product(stream->h.frame_count, sizeof(*stream->clen),
+                     &lengths_bytes) < 0 ||
+        size_product(stream->h.frame_count, sizeof(*stream->offset),
+                     &offsets_bytes) < 0) {
+        *fallback_reason = "stream dimensions too large";
+        goto fail;
+    }
+
+    long payload_start = ftell(file);
+    if (payload_start < 0 || fseek(file, 0, SEEK_END) != 0) {
+        *fallback_reason = "stream seek failed";
+        goto fail;
+    }
+    long file_end = ftell(file);
+    if (file_end < payload_start || fseek(file, payload_start, SEEK_SET) != 0) {
+        *fallback_reason = "invalid stream size";
+        goto fail;
+    }
+    stream->size = (size_t)(file_end - payload_start);
+    validation = stream_validate_payload_size(stream->size);
+    if (validation != STREAM_VALID) {
+        *fallback_reason = stream_validation_name(validation);
+        goto fail;
+    }
+    if (stream->h.frame_count > stream->size / 5u) {
+        *fallback_reason = "truncated frame table";
+        goto fail;
+    }
+
+    stream->data = malloc(stream->size ? stream->size : 1);
+    stream->clen = malloc(lengths_bytes);
+    stream->offset = malloc(offsets_bytes);
+    if (!stream->data || !stream->clen || !stream->offset) {
+        *fallback_reason = "stream allocation failed";
+        goto fail;
+    }
+    if (fread(stream->data, 1, stream->size, file) != stream->size) {
+        *fallback_reason = "short stream read";
+        goto fail;
+    }
+
+    validation = stream_index_frames(stream->data, stream->size,
+                                     stream->h.frame_count,
+                                     stream_frame_compressed_limit(frame_bytes),
+                                     stream->clen, stream->offset);
+    if (validation != STREAM_VALID) {
+        *fallback_reason = stream_validation_name(validation);
+        goto fail;
+    }
+
+    stream->frame = malloc(frame_bytes);
+    if (!stream->frame) {
+        *fallback_reason = "stream frame allocation failed";
+        goto fail;
+    }
+
+    if (surface->format != FB_PIXEL_RGB565) {
+        stream->lut = malloc(65536u * sizeof(*stream->lut));
+        if (!stream->lut) {
+            *fallback_reason = "stream conversion allocation failed";
+            goto fail;
+        }
+        for (uint32_t pixel = 0; pixel < 65536u; pixel++)
+            stream->lut[pixel] = rgb565_to_32_pixel((uint16_t)pixel,
+                                                    surface->format);
+    }
+
+    fclose(file);
+    fprintf(stderr, "render mode: stream (%u frames, %ums, %s%s)\n",
+            stream->h.frame_count, stream->h.interval_ms,
+            fb_pixel_format_name(surface->format),
+            (stream->h.flags & STREAM_FLAG_LOOP) ? ", looping" : "");
+    *fallback_reason = "none";
+    return stream;
+
+fail:
+    fclose(file);
+    stream_free(stream);
+    return NULL;
+}
+
+static int stream_show(struct stream *stream, uint32_t index,
+                       struct fb_surface *surface)
+{
+    size_t source_bytes = (size_t)surface->width * surface->height *
+                          sizeof(*stream->frame);
+    uLongf output_length = (uLongf)source_bytes;
+    int result = uncompress((Bytef *)stream->frame, &output_length,
+                            stream->data + stream->offset[index],
+                            stream->clen[index]);
+    if (result != Z_OK || output_length != source_bytes) {
+        fprintf(stderr, "stream frame %u: decompression failed (%d)\n",
+                index, result);
+        return -1;
+    }
+
+    fb_copy_rgb565(surface, stream->frame, stream->lut);
+    stream->has_frame = 1;
+    return 0;
+}
+
+static int stream_play(struct stream *stream, struct fb_surface *surface,
+                       int once, int *notified, struct run_stats *stats)
+{
+    while (!stop_signals) {
         struct timespec run_start;
         clock_gettime(CLOCK_MONOTONIC, &run_start);
-        uint32_t shown = UINT32_MAX;
+        uint32_t shown_index = UINT32_MAX;
+        stats_start_run(stats);
 
         for (;;) {
-            long ms = elapsed_ms(&run_start);
-            uint32_t idx = (uint32_t)(ms / (long)s->h.interval_ms);
-            int final = idx >= last;
-            if (final)
-                idx = last;
+            uint64_t elapsed = elapsed_since(&run_start);
+            int final;
+            uint32_t index = cadence_frame_index(elapsed,
+                                                 stream->h.interval_ms,
+                                                 stream->h.frame_count,
+                                                 &final);
 
-            if (idx != shown) {
-                if (stream_show(s, idx, fb, frame_bytes) < 0)
-                    return;
-                shown = idx;
-                if (!notified) {
+            if (index != shown_index) {
+                if (stream_show(stream, index, surface) < 0)
+                    return -1;
+                shown_index = index;
+                uint64_t displayed = elapsed_since(&run_start);
+                stats_note(stats, index, displayed,
+                           cadence_deadline_ms(index, stream->h.interval_ms),
+                           stream->h.interval_ms, 0);
+                if (!*notified) {
                     sd_notify_ready();
-                    notified = 1;
+                    *notified = 1;
                 }
             }
 
-            if (final || quit)
+            if (final || stop_signals)
                 break;
 
-            struct timespec next;
-            clock_gettime(CLOCK_MONOTONIC, &next);
-            timespec_add_ms(&next, s->h.interval_ms);
-            sleep_until(&next);
+            struct timespec deadline = run_start;
+            timespec_add_ms(&deadline,
+                            cadence_deadline_ms(index + 1,
+                                                stream->h.interval_ms));
+            sleep_until(&deadline);
         }
 
-        if (once || quit || !(s->h.flags & STREAM_FLAG_LOOP))
+        if (once || stop_signals || !(stream->h.flags & STREAM_FLAG_LOOP))
             break;
     }
+    return 0;
 }
 
-/* Fade the frame we ended on down to black, then clear. */
-static void stream_fade_out(struct stream *s, void *fb, int width, int height,
-                            int fade_ms, size_t fb_size)
+static int stream_fade_out(struct stream *stream, struct fb_surface *surface,
+                           int fade_ms, struct run_stats *stats)
 {
-    if (fade_ms > 0) {
-        long frame_ms = s->h.interval_ms;
-        int steps = fade_ms / (int)frame_ms;
+    int result = 0;
+
+    if (fade_ms > 0 && stream->has_frame) {
+        uint32_t frame_ms = stream->h.interval_ms;
+        uint32_t steps = (uint32_t)fade_ms / frame_ms;
         if (steps < 2)
             steps = 2;
 
-        uint16_t *last = malloc((size_t)width * height * 2);
+        size_t pixels = (size_t)surface->width * surface->height;
+        uint16_t *last = malloc(pixels * sizeof(*last));
         if (last) {
-            memcpy(last, s->frame, (size_t)width * height * 2);
+            memcpy(last, stream->frame, pixels * sizeof(*last));
+            struct timespec fade_start;
+            clock_gettime(CLOCK_MONOTONIC, &fade_start);
+            stats->have_fade_slot = 0;
 
-            struct timespec next;
-            clock_gettime(CLOCK_MONOTONIC, &next);
-            for (int step = 1; step <= steps && !quit; step++) {
+            uint32_t next_step = 1;
+            while (next_step <= steps && !stop_signals) {
+                struct timespec deadline = fade_start;
+                timespec_add_ms(&deadline,
+                                fade_deadline_ms(next_step,
+                                                 (uint32_t)fade_ms, steps));
+                sleep_until(&deadline);
+                if (stop_signals)
+                    break;
+
+                uint64_t elapsed = elapsed_since(&fade_start);
+                uint32_t step = fade_step_at(elapsed, (uint32_t)fade_ms,
+                                             steps, next_step);
                 float alpha = 1.0f - (float)step / steps;
-                uint16_t *dst = fb;
-                for (int i = 0; i < width * height; i++) {
-                    uint16_t px = last[i];
-                    uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * alpha);
-                    uint8_t g = (uint8_t)(((px >>  5) & 0x3F) * alpha);
-                    uint8_t b = (uint8_t)(( px        & 0x1F) * alpha);
-                    dst[i] = (r << 11) | (g << 5) | b;
+                for (size_t i = 0; i < pixels; i++) {
+                    uint16_t pixel = last[i];
+                    uint16_t red = (uint16_t)(((pixel >> 11) & 0x1f) * alpha);
+                    uint16_t green = (uint16_t)(((pixel >> 5) & 0x3f) * alpha);
+                    uint16_t blue = (uint16_t)((pixel & 0x1f) * alpha);
+                    stream->frame[i] = (uint16_t)((red << 11) |
+                                                   (green << 5) | blue);
                 }
-                timespec_add_ms(&next, frame_ms);
-                sleep_until(&next);
+                fb_copy_rgb565(surface, stream->frame, stream->lut);
+                uint64_t displayed = elapsed_since(&fade_start);
+                uint64_t due = fade_deadline_ms(step, (uint32_t)fade_ms,
+                                                steps);
+                uint32_t budget = (uint32_t)(((uint64_t)fade_ms + steps - 1u) /
+                                             steps);
+                stats_note(stats, step - 1u, displayed, due, budget, 1);
+                next_step = step + 1u;
             }
             free(last);
+        } else {
+            result = -1;
         }
     }
 
-    memset(fb, 0, fb_size);
+    fb_clear_visible(surface);
+    return result;
+}
+
+/* ---------------------------------------------------------- live rendering */
+
+static int live_fade_out(uint32_t *argb_buffer, struct fb_surface *surface,
+                         uint32_t frame_ms, int fade_ms,
+                         struct run_stats *stats)
+{
+    if (fade_ms <= 0)
+        return 0;
+
+    uint32_t steps = (uint32_t)fade_ms / frame_ms;
+    if (steps < 2)
+        steps = 2;
+    size_t pixels = (size_t)surface->width * surface->height;
+    uint32_t *last = malloc(pixels * sizeof(*last));
+    if (!last)
+        return -1;
+    memcpy(last, argb_buffer, pixels * sizeof(*last));
+
+    struct timespec fade_start;
+    clock_gettime(CLOCK_MONOTONIC, &fade_start);
+    stats->have_fade_slot = 0;
+    uint32_t next_step = 1;
+    while (next_step <= steps && !stop_signals) {
+        struct timespec deadline = fade_start;
+        timespec_add_ms(&deadline,
+                        fade_deadline_ms(next_step, (uint32_t)fade_ms, steps));
+        sleep_until(&deadline);
+        if (stop_signals)
+            break;
+
+        uint64_t elapsed = elapsed_since(&fade_start);
+        uint32_t step = fade_step_at(elapsed, (uint32_t)fade_ms, steps,
+                                     next_step);
+        float alpha = 1.0f - (float)step / steps;
+        for (size_t i = 0; i < pixels; i++) {
+            uint32_t pixel = last[i];
+            uint8_t red = (uint8_t)(((pixel >> 16) & 0xff) * alpha);
+            uint8_t green = (uint8_t)(((pixel >> 8) & 0xff) * alpha);
+            uint8_t blue = (uint8_t)((pixel & 0xff) * alpha);
+            argb_buffer[i] = 0xff000000u | (uint32_t)red << 16 |
+                             (uint32_t)green << 8 | blue;
+        }
+        fb_copy_argb(surface, argb_buffer);
+        uint64_t displayed = elapsed_since(&fade_start);
+        uint64_t due = fade_deadline_ms(step, (uint32_t)fade_ms, steps);
+        uint32_t budget = (uint32_t)(((uint64_t)fade_ms + steps - 1u) /
+                                     steps);
+        stats_note(stats, step - 1u, displayed, due, budget, 1);
+        next_step = step + 1u;
+    }
+
+    free(last);
+    return 0;
+}
+
+static int render_live(const char *lottie_path, struct fb_surface *surface,
+                       int target_fps, int fade_ms, int once, int *notified,
+                       struct run_stats *stats, const char **failure_reason)
+{
+    int engine_started = 0;
+    Tvg_Canvas canvas = NULL;
+    Tvg_Animation animation = NULL;
+    uint32_t *argb_buffer = NULL;
+    int result = -1;
+
+    if (tvg_engine_init(0) != TVG_RESULT_SUCCESS) {
+        *failure_reason = "ThorVG engine initialization failed";
+        goto cleanup;
+    }
+    engine_started = 1;
+
+    canvas = tvg_swcanvas_create(TVG_ENGINE_OPTION_DEFAULT);
+    if (!canvas) {
+        *failure_reason = "ThorVG canvas creation failed";
+        goto cleanup;
+    }
+
+    size_t render_pixels;
+    if (size_product(surface->width, surface->height, &render_pixels) < 0 ||
+        render_pixels > SIZE_MAX / sizeof(*argb_buffer)) {
+        *failure_reason = "live render dimensions overflow";
+        goto cleanup;
+    }
+    argb_buffer = calloc(render_pixels, sizeof(*argb_buffer));
+    if (!argb_buffer) {
+        *failure_reason = "live render buffer allocation failed";
+        goto cleanup;
+    }
+
+    if (tvg_swcanvas_set_target(canvas, argb_buffer, surface->width,
+                                surface->width, surface->height,
+                                TVG_COLORSPACE_ARGB8888) != TVG_RESULT_SUCCESS) {
+        *failure_reason = "ThorVG target setup failed";
+        goto cleanup;
+    }
+
+    animation = tvg_animation_new();
+    if (!animation) {
+        *failure_reason = "ThorVG animation creation failed";
+        goto cleanup;
+    }
+    Tvg_Paint picture = tvg_animation_get_picture(animation);
+    if (!picture) {
+        *failure_reason = "ThorVG picture creation failed";
+        goto cleanup;
+    }
+    if (tvg_picture_load(picture, lottie_path) != TVG_RESULT_SUCCESS) {
+        *failure_reason = "live JSON load failed";
+        goto cleanup;
+    }
+
+    float picture_width = 0;
+    float picture_height = 0;
+    if (tvg_picture_get_size(picture, &picture_width, &picture_height) !=
+        TVG_RESULT_SUCCESS) {
+        *failure_reason = "live picture size query failed";
+        goto cleanup;
+    }
+    if (picture_width > 0 && picture_height > 0) {
+        float scale_x = (float)surface->width / picture_width;
+        float scale_y = (float)surface->height / picture_height;
+        float scale = scale_x < scale_y ? scale_x : scale_y;
+        if (tvg_paint_scale(picture, scale) != TVG_RESULT_SUCCESS ||
+            tvg_paint_translate(
+                picture,
+                (surface->width - picture_width * scale) / 2.0f,
+                (surface->height - picture_height * scale) / 2.0f) !=
+            TVG_RESULT_SUCCESS) {
+            *failure_reason = "live picture transform failed";
+            goto cleanup;
+        }
+    }
+
+    float total_frames = 0;
+    float duration = 0;
+    if (tvg_animation_get_total_frame(animation, &total_frames) !=
+            TVG_RESULT_SUCCESS ||
+        tvg_animation_get_duration(animation, &duration) != TVG_RESULT_SUCCESS) {
+        *failure_reason = "live animation timing query failed";
+        goto cleanup;
+    }
+    if (!(total_frames >= 1.0f) || !isfinite(total_frames)) {
+        *failure_reason = "live animation has no valid frames";
+        goto cleanup;
+    }
+    if (duration <= 0.0f) {
+        if (target_fps <= 0) {
+            *failure_reason = "live animation duration is zero without --fps";
+            goto cleanup;
+        }
+        duration = total_frames / (float)target_fps;
+    }
+
+    float native_fps = total_frames / duration;
+    float render_fps = target_fps > 0 ? (float)target_fps : native_fps;
+    if (!(duration > 0.0f) || !isfinite(duration) ||
+        !(native_fps > 0.0f) || !isfinite(native_fps) ||
+        !(render_fps > 0.0f) || !isfinite(render_fps)) {
+        *failure_reason = "live animation has invalid timing";
+        goto cleanup;
+    }
+    double frame_ms_value = 1000.0 / (double)render_fps;
+    if (!isfinite(frame_ms_value) || frame_ms_value > UINT32_MAX) {
+        *failure_reason = "live frame interval is out of range";
+        goto cleanup;
+    }
+    uint32_t frame_ms = (uint32_t)frame_ms_value;
+    if (frame_ms < 1)
+        frame_ms = 1;
+    double duration_ms_value = ceil((double)duration * 1000.0);
+    if (!(duration_ms_value >= 1.0) || duration_ms_value > UINT32_MAX) {
+        *failure_reason = "live animation duration is out of range";
+        goto cleanup;
+    }
+    uint64_t duration_ms = (uint64_t)duration_ms_value;
+    uint64_t final_start_ms = 0;
+    if (total_frames > 1.0f) {
+        double final_start_value = ceil(((double)total_frames - 1.0) * 1000.0 /
+                                        (double)native_fps);
+        if (final_start_value > 0.0)
+            final_start_ms = (uint64_t)final_start_value;
+        if (final_start_ms > duration_ms)
+            final_start_ms = duration_ms;
+    }
+
+    fprintf(stderr,
+            "live animation: %.0f frames, %.2fs, native %.1f fps, cap %.1f fps\n",
+            total_frames, duration, native_fps, render_fps);
+    if (tvg_canvas_add(canvas, picture) != TVG_RESULT_SUCCESS) {
+        *failure_reason = "ThorVG canvas setup failed";
+        goto cleanup;
+    }
+
+    while (!stop_signals) {
+        struct timespec run_start;
+        clock_gettime(CLOCK_MONOTONIC, &run_start);
+        stats_start_run(stats);
+        int displayed_final = 0;
+
+        for (;;) {
+            uint64_t elapsed = elapsed_since(&run_start);
+            int complete = timeline_complete(elapsed, duration_ms);
+            if (complete && displayed_final)
+                break;
+
+            uint64_t slot = elapsed / frame_ms;
+            float frame = (float)elapsed * native_fps / 1000.0f;
+            int selected_final = frame >= total_frames - 1.0f;
+            if (selected_final)
+                frame = total_frames - 1.0f;
+
+            Tvg_Result frame_result = tvg_animation_set_frame(animation, frame);
+            if ((frame_result != TVG_RESULT_SUCCESS &&
+                 frame_result != TVG_RESULT_INSUFFICIENT_CONDITION) ||
+                tvg_canvas_update(canvas) != TVG_RESULT_SUCCESS ||
+                tvg_canvas_draw(canvas, true) != TVG_RESULT_SUCCESS ||
+                tvg_canvas_sync(canvas) != TVG_RESULT_SUCCESS) {
+                *failure_reason = "live frame rendering failed";
+                goto cleanup;
+            }
+            fb_copy_argb(surface, argb_buffer);
+            displayed_final |= selected_final;
+
+            uint64_t displayed = elapsed_since(&run_start);
+            stats_note(stats, slot, displayed, slot * frame_ms,
+                       frame_ms, 0);
+            if (!*notified) {
+                sd_notify_ready();
+                *notified = 1;
+            }
+
+            if (complete || stop_signals)
+                break;
+
+            uint64_t next_ms = displayed_final ? duration_ms :
+                               (slot + 1u) * frame_ms;
+            if (!displayed_final && final_start_ms > elapsed &&
+                final_start_ms < next_ms)
+                next_ms = final_start_ms;
+            if (next_ms > duration_ms)
+                next_ms = duration_ms;
+            struct timespec deadline = run_start;
+            timespec_add_ms(&deadline, next_ms);
+            sleep_until(&deadline);
+        }
+
+        if (once || stop_signals)
+            break;
+    }
+
+    if (once && !stop_signals)
+        fprintf(stderr, "holding last frame until SIGTERM\n");
+    if (signal_prepare_fade(&stop_signals, once) < 0) {
+        *failure_reason = "signal wait setup failed";
+        fb_clear_visible(surface);
+        goto cleanup;
+    }
+
+    if (live_fade_out(argb_buffer, surface, frame_ms, fade_ms, stats) < 0) {
+        *failure_reason = "live fade snapshot allocation failed";
+        fb_clear_visible(surface);
+        goto cleanup;
+    }
+    fb_clear_visible(surface);
+    result = 0;
+
+cleanup:
+    if (animation)
+        tvg_animation_del(animation);
+    free(argb_buffer);
+    if (canvas)
+        tvg_canvas_destroy(canvas);
+    if (engine_started)
+        tvg_engine_term();
+    return result;
+}
+
+static struct fb_channel_layout channel_layout(struct fb_bitfield field)
+{
+    struct fb_channel_layout result = {
+        .offset = field.offset,
+        .length = field.length,
+        .msb_right = field.msb_right,
+    };
+    return result;
 }
 
 int main(int argc, char *argv[])
@@ -321,12 +722,22 @@ int main(int argc, char *argv[])
     }
 
     if (!lottie_path) {
-        fprintf(stderr, "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]\n");
+        fprintf(stderr,
+                "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]\n");
         return 1;
     }
 
-    signal(SIGTERM, handle_signal);
-    signal(SIGINT, handle_signal);
+    struct sigaction signal_action;
+    memset(&signal_action, 0, sizeof(signal_action));
+    signal_action.sa_handler = handle_signal;
+    sigemptyset(&signal_action.sa_mask);
+    sigaddset(&signal_action.sa_mask, SIGTERM);
+    sigaddset(&signal_action.sa_mask, SIGINT);
+    if (sigaction(SIGTERM, &signal_action, NULL) < 0 ||
+        sigaction(SIGINT, &signal_action, NULL) < 0) {
+        perror("install signal handler");
+        return 1;
+    }
 
     int fb_fd = open("/dev/fb0", O_RDWR);
     if (fb_fd < 0) {
@@ -334,253 +745,123 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    struct fb_var_screeninfo vinfo;
-    struct fb_fix_screeninfo finfo;
-    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0 ||
-        ioctl(fb_fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+    struct fb_var_screeninfo variable;
+    struct fb_fix_screeninfo fixed;
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &variable) < 0 ||
+        ioctl(fb_fd, FBIOGET_FSCREENINFO, &fixed) < 0) {
         perror("ioctl fb");
         close(fb_fd);
         return 1;
     }
 
-    int width = vinfo.xres;
-    int height = vinfo.yres;
-    int bpp = vinfo.bits_per_pixel;
-    size_t fb_size = finfo.smem_len;
-
-    fprintf(stderr, "fb0: %dx%d %dbpp stride=%d fb_size=%zu\n",
-            width, height, bpp, finfo.line_length, fb_size);
-
-    if (bpp != 16 && bpp != 32) {
-        fprintf(stderr, "unsupported bpp: %d (need 16 or 32)\n", bpp);
+    if (variable.nonstd != 0 || variable.grayscale != 0 ||
+        fixed.type != FB_TYPE_PACKED_PIXELS ||
+        fixed.visual != FB_VISUAL_TRUECOLOR) {
+        fprintf(stderr, "fb0 rejected: unsupported framebuffer organization\n");
         close(fb_fd);
         return 1;
     }
 
-    void *fb_mmap = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
-    if (fb_mmap == MAP_FAILED) {
+    size_t mapping_size = fixed.smem_len;
+    void *mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fb_fd, 0);
+    if (mapping == MAP_FAILED) {
         perror("mmap fb");
         close(fb_fd);
         return 1;
     }
 
-    /*
-     * Prefer a prerendered stream. Rasterising Lottie costs more per frame
-     * than the frame budget on the DBC, which both stretches the animation
-     * and steals CPU from the dashboard we are waiting for; a packed stream
-     * is a decompress and a memcpy. Any reason not to use one (absent,
-     * malformed, different geometry) falls through to rendering it live.
-     */
-    struct stream *stream = stream_load(lottie_path, width, height, bpp);
-    if (stream) {
-        const size_t frame_bytes = (size_t)width * height * 2;
-
-        stream_play(stream, fb_mmap, frame_bytes, once);
-
-        if (once && !quit) {
-            fprintf(stderr, "holding last frame until SIGTERM\n");
-            while (!quit)
-                pause();
-        }
-
-        quit = 0;
-        stream_fade_out(stream, fb_mmap, width, height, fade_ms, fb_size);
-
-        stream_free(stream);
-        munmap(fb_mmap, fb_size);
+    struct fb_surface surface;
+    const char *layout_error = NULL;
+    if (fb_surface_init(&surface, mapping, mapping_size,
+                        variable.xres, variable.yres,
+                        variable.xres_virtual, variable.yres_virtual,
+                        variable.xoffset, variable.yoffset,
+                        variable.bits_per_pixel, fixed.line_length,
+                        channel_layout(variable.red),
+                        channel_layout(variable.green),
+                        channel_layout(variable.blue),
+                        channel_layout(variable.transp),
+                        &layout_error) < 0) {
+        fprintf(stderr, "fb0 rejected: %s\n", layout_error);
+        munmap(mapping, mapping_size);
         close(fb_fd);
-        return 0;
+        return 1;
     }
 
-    if (tvg_engine_init(0) != TVG_RESULT_SUCCESS) {
-        fprintf(stderr, "tvg_engine_init failed\n");
-        goto cleanup_fb;
-    }
+    fprintf(stderr, "fb0: %ux%u %s, stride=%zu, offset=%zu, map=%zu\n",
+            surface.width, surface.height,
+            fb_pixel_format_name(surface.format), surface.stride,
+            surface.visible_offset, surface.mapping_size);
 
-    Tvg_Canvas canvas = tvg_swcanvas_create(TVG_ENGINE_OPTION_DEFAULT);
-    if (!canvas) {
-        fprintf(stderr, "tvg_swcanvas_create failed\n");
-        goto cleanup_engine;
-    }
-
-    /* ARGB8888 render buffer for ThorVG */
-    uint32_t *argb_buf = calloc(width * height, sizeof(uint32_t));
-    if (!argb_buf) {
-        perror("calloc argb buffer");
-        goto cleanup_canvas;
-    }
-
-    if (tvg_swcanvas_set_target(canvas, argb_buf, width, width, height,
-                                TVG_COLORSPACE_ARGB8888) != TVG_RESULT_SUCCESS) {
-        fprintf(stderr, "tvg_swcanvas_set_target failed\n");
-        goto cleanup_buf;
-    }
-
-    Tvg_Animation anim = tvg_animation_new();
-    if (!anim) {
-        fprintf(stderr, "tvg_animation_new failed\n");
-        goto cleanup_buf;
-    }
-
-    Tvg_Paint picture = tvg_animation_get_picture(anim);
-    if (!picture) {
-        fprintf(stderr, "tvg_animation_get_picture failed\n");
-        goto cleanup_anim;
-    }
-
-    if (tvg_picture_load(picture, lottie_path) != TVG_RESULT_SUCCESS) {
-        fprintf(stderr, "tvg_picture_load(%s) failed\n", lottie_path);
-        goto cleanup_anim;
-    }
-
-    float pw = 0, ph = 0;
-    tvg_picture_get_size(picture, &pw, &ph);
-    fprintf(stderr, "lottie size: %.0fx%.0f\n", pw, ph);
-    if (pw > 0 && ph > 0) {
-        float scale_x = (float)width / pw;
-        float scale_y = (float)height / ph;
-        float scale = scale_x < scale_y ? scale_x : scale_y;
-        float offset_x = (width - pw * scale) / 2.0f;
-        float offset_y = (height - ph * scale) / 2.0f;
-        tvg_paint_scale(picture, scale);
-        tvg_paint_translate(picture, offset_x, offset_y);
-        fprintf(stderr, "scale=%.3f offset=(%.0f,%.0f)\n", scale, offset_x, offset_y);
-    }
-
-    float total_frames = 0;
-    float duration = 0;
-    tvg_animation_get_total_frame(anim, &total_frames);
-    tvg_animation_get_duration(anim, &duration);
-
-    if (total_frames < 1) {
-        fprintf(stderr, "animation has no frames\n");
-        goto cleanup_anim;
-    }
-
-    if (duration <= 0.0f) {
-        if (target_fps <= 0) {
-            fprintf(stderr, "animation duration is 0 — use --fps to specify frame rate\n");
-            goto cleanup_anim;
-        }
-        duration = total_frames / (float)target_fps;
-    }
-
-    float native_fps = total_frames / duration;
-    float render_fps = (target_fps > 0) ? target_fps : native_fps;
-    long frame_ms = (long)(1000.0f / render_fps);
-
-    fprintf(stderr, "animation: %.0f frames, %.2fs, native %.1f fps, render cap %.1f fps (frame_ms=%ld)\n",
-            total_frames, duration, native_fps, render_fps, frame_ms);
-
-    tvg_canvas_add(canvas, picture);
-
+    struct run_stats stats = {0};
+    const char *stream_failure = "none";
+    const char *live_failure = "not attempted";
+    const char *selected_mode = "stream";
     int notified = 0;
-    while (!quit) {
-        /*
-         * Pick the frame from elapsed wall time rather than stepping a counter.
-         * On the DBC a render costs more than its slot during boot (we compete
-         * with the dashboard's startup for the CPU), and a counter would stretch
-         * an 8s animation to 16s. Dropping frames keeps the run at `duration`
-         * seconds, so we reliably reach the final frame before the dashboard
-         * takes the display over.
-         */
-        struct timespec run_start;
-        clock_gettime(CLOCK_MONOTONIC, &run_start);
-        int last_reported = -1;
+    int result = 0;
 
-        for (;;) {
-            float frame = elapsed_ms(&run_start) * native_fps / 1000.0f;
-            int final = frame >= total_frames - 1;
-            if (final)
-                frame = total_frames - 1;
-
-            tvg_animation_set_frame(anim, frame);
-            tvg_canvas_update(canvas);
-            tvg_canvas_draw(canvas, true);
-            tvg_canvas_sync(canvas);
-
-            if (bpp == 16) {
-                argb_to_rgb565(argb_buf, (uint16_t *)fb_mmap, width * height);
-            } else {
-                memcpy(fb_mmap, argb_buf, width * height * 4);
+    struct stream *stream = stream_load(lottie_path, &surface,
+                                        &stream_failure);
+    if (stream) {
+        if (stream_play(stream, &surface, once, &notified, &stats) == 0) {
+            if (once && !stop_signals)
+                fprintf(stderr, "holding last frame until SIGTERM\n");
+            if (signal_prepare_fade(&stop_signals, once) < 0) {
+                perror("signal wait setup failed");
+                stream_failure = "signal wait setup failed";
+                selected_mode = "failed";
+                result = 1;
+                fb_clear_visible(&surface);
+                goto finished;
             }
-
-            if (!notified) {
-                sd_notify_ready();
-                notified = 1;
+            if (stream_fade_out(stream, &surface, fade_ms, &stats) < 0) {
+                stream_failure = "stream fade snapshot allocation failed";
+                fprintf(stderr, "stream failure: %s\n", stream_failure);
+                selected_mode = "failed";
+                result = 1;
             }
-
-            if ((int)frame / 100 != last_reported) {
-                last_reported = (int)frame / 100;
-                fprintf(stderr, "frame %.0f/%.0f\n", frame, total_frames);
-            }
-
-            if (final || quit)
-                break;
-
-            struct timespec next_frame;
-            clock_gettime(CLOCK_MONOTONIC, &next_frame);
-            timespec_add_ms(&next_frame, frame_ms);
-            sleep_until(&next_frame);
+            goto finished;
         }
-
-        if (once || quit) break;
+        stream_failure = "stream decompression failed";
+        fprintf(stderr, "stream failure: %s\n", stream_failure);
+        stream_free(stream);
+        stream = NULL;
     }
 
-    /* In --once mode, hold the last frame visible until SIGTERM */
-    if (once && !quit) {
-        fprintf(stderr, "holding last frame until SIGTERM\n");
-        while (!quit)
-            pause();
+    char live_path[PATH_MAX];
+    selected_mode = "live";
+    fprintf(stderr, "render mode: live (stream failure: %s)\n",
+            stream_failure);
+    if (animation_live_path(live_path, sizeof(live_path), lottie_path) < 0) {
+        live_failure = "live fallback path is too long";
+        selected_mode = "failed";
+        result = 1;
+    } else if (render_live(live_path, &surface, target_fps, fade_ms, once,
+                           &notified, &stats, &live_failure) < 0) {
+        selected_mode = "failed";
+        result = 1;
+    } else {
+        live_failure = "none";
     }
+    if (result != 0)
+        fprintf(stderr, "live failure: %s\n", live_failure);
 
-    /* Always fade on exit — first SIGTERM triggers fade, second aborts it */
-    quit = 0;
-    if (fade_ms > 0) {
-        int fade_steps = fade_ms / frame_ms;
-        if (fade_steps < 2) fade_steps = 2;
+finished:
+    stream_free(stream);
+    fprintf(stderr,
+            "summary: mode=%s stream_failure=\"%s\" live_failure=\"%s\" "
+            "shown=%llu skipped=%llu fade_shown=%llu fade_skipped=%llu "
+            "missed_deadlines=%llu max_lateness_ms=%llu\n",
+            selected_mode, stream_failure, live_failure,
+            (unsigned long long)stats.frames_shown,
+            (unsigned long long)stats.frames_skipped,
+            (unsigned long long)stats.fade_frames_shown,
+            (unsigned long long)stats.fade_frames_skipped,
+            (unsigned long long)stats.missed_deadlines,
+            (unsigned long long)stats.max_lateness_ms);
 
-        uint32_t *last_frame = malloc(width * height * sizeof(uint32_t));
-        if (last_frame) {
-            memcpy(last_frame, argb_buf, width * height * sizeof(uint32_t));
-
-            struct timespec next_frame;
-            clock_gettime(CLOCK_MONOTONIC, &next_frame);
-            for (int step = 1; step <= fade_steps && !quit; step++) {
-                float alpha = 1.0f - (float)step / fade_steps;
-                for (int i = 0; i < width * height; i++) {
-                    uint32_t px = last_frame[i];
-                    uint8_t r = (uint8_t)(((px >> 16) & 0xFF) * alpha);
-                    uint8_t g = (uint8_t)(((px >>  8) & 0xFF) * alpha);
-                    uint8_t b = (uint8_t)(( px        & 0xFF) * alpha);
-                    argb_buf[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-                }
-
-                if (bpp == 16)
-                    argb_to_rgb565(argb_buf, (uint16_t *)fb_mmap, width * height);
-                else
-                    memcpy(fb_mmap, argb_buf, width * height * 4);
-
-                timespec_add_ms(&next_frame, frame_ms);
-                sleep_until(&next_frame);
-            }
-            free(last_frame);
-        }
-    }
-
-    memset(fb_mmap, 0, fb_size);
-
-cleanup_anim:
-    tvg_animation_del(anim);
-cleanup_buf:
-    free(argb_buf);
-cleanup_canvas:
-    tvg_canvas_destroy(canvas);
-cleanup_engine:
-    tvg_engine_term();
-cleanup_fb:
-    munmap(fb_mmap, fb_size);
+    munmap(mapping, mapping_size);
     close(fb_fd);
-
-    return 0;
+    return result;
 }
