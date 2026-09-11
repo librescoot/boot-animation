@@ -1,4 +1,4 @@
-# boot-animation
+# Librescoot Boot Animation
 
 Renders a Lottie JSON animation to `/dev/fb0` using [ThorVG](https://www.thorvg.org/)'s software renderer. Designed as the boot splash for Librescoot's Dashboard Computer (i.MX6 Cortex-A9, 480×480 RGB565 display).
 
@@ -148,3 +148,5 @@ The maintainers reserve the right to grant separate licenses for commercial dist
 
 [cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
 [cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
+
+Made with ❤️ by the Librescoot community
