@@ -94,6 +94,7 @@ static void *play_wav(void *arg)
     const char *path = audio->path;
     int fd = -1;
     uint8_t *file = MAP_FAILED;
+    uint8_t *expanded = NULL;
     snd_pcm_t *pcm = NULL;
     char *device = NULL;
     struct stat st;
@@ -128,12 +129,31 @@ static void *play_wav(void *arg)
         offset = payload + size + (size & 1u);
     }
 
+    uint16_t channels = fmt && fmt_size >= 16 ? read_le16(fmt + 2) : 0;
     if (!fmt || fmt_size < 16 || !data || read_le16(fmt) != 1 ||
-        read_le16(fmt + 2) != 2 || read_le32(fmt + 4) != 48000 ||
-        read_le16(fmt + 14) != 16) {
+        (channels != 1 && channels != 2) || read_le32(fmt + 4) != 48000 ||
+        read_le16(fmt + 14) != 16 || data_size % (channels * 2) != 0) {
 invalid:
-        fprintf(stderr, "%s: expected 48 kHz stereo 16-bit PCM WAV\n", path);
+        fprintf(stderr, "%s: expected 48 kHz mono/stereo 16-bit PCM WAV\n", path);
         goto done;
+    }
+
+    const uint8_t *pcm_data = data;
+    size_t pcm_size = data_size;
+    if (channels == 1) {
+        if (data_size > SIZE_MAX / 2)
+            goto done;
+        expanded = malloc((size_t)data_size * 2);
+        if (!expanded)
+            goto done;
+        for (size_t i = 0; i < data_size / 2; i++) {
+            expanded[i * 4] = data[i * 2];
+            expanded[i * 4 + 1] = data[i * 2 + 1];
+            expanded[i * 4 + 2] = data[i * 2];
+            expanded[i * 4 + 3] = data[i * 2 + 1];
+        }
+        pcm_data = expanded;
+        pcm_size = (size_t)data_size * 2;
     }
 
     struct timespec deadline;
@@ -169,10 +189,10 @@ invalid:
     fprintf(stderr, "startup audio: using %s\n", device);
 
     clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += data_size / 192000 + 3;
+    deadline.tv_sec += pcm_size / 192000 + 3;
 
-    const uint8_t *cursor = data;
-    snd_pcm_uframes_t frames = data_size / 4;
+    const uint8_t *cursor = pcm_data;
+    snd_pcm_uframes_t frames = pcm_size / 4;
     while (frames > 0 && !audio_stop && !audio_timed_out(&deadline)) {
         snd_pcm_sframes_t written = snd_pcm_writei(pcm, cursor, frames);
         if (written == -EAGAIN) {
@@ -202,6 +222,7 @@ done:
     if (pcm)
         snd_pcm_close(pcm);
     free(device);
+    free(expanded);
     if (file != MAP_FAILED)
         munmap(file, (size_t)st.st_size);
     if (fd >= 0)

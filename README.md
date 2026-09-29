@@ -115,7 +115,7 @@ boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--a
 | `--fps N` | animation's native FPS | Target render frame rate; also used if the animation reports zero duration |
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
-| `--sound WAV` | off | Play a 48 kHz stereo 16-bit PCM WAV during animation playback |
+| `--sound WAV` | off | Play a 48 kHz mono or stereo 16-bit PCM WAV during animation playback |
 | `--audio-device PCM` | `auto` | ALSA PCM device; automatic selection prefers the built-in output |
 
 ### Exit behaviour
