@@ -4,7 +4,7 @@
  * Renders a Lottie JSON animation directly to the framebuffer using ThorVG's
  * software renderer. Designed for embedded boot splash on i.MX6 (Cortex-A9).
  *
- * Usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once]
+ * Usage: boot-animation <lottie.json> [--intro intro.json] [--fps N] [--fade-ms N] [--once]
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -472,8 +472,9 @@ static int live_fade_out(uint32_t *argb_buffer, struct fb_surface *surface,
 }
 
 static int render_live(const char *lottie_path, struct fb_surface *surface,
-                       int target_fps, int fade_ms, int once, int *notified,
-                       struct run_stats *stats, const char **failure_reason)
+                       int target_fps, int fade_ms, int once, int handoff,
+                       int *notified, struct run_stats *stats,
+                       const char **failure_reason)
 {
     int engine_started = 0;
     Tvg_Canvas canvas = NULL;
@@ -666,6 +667,10 @@ static int render_live(const char *lottie_path, struct fb_surface *surface,
             break;
     }
 
+    if (handoff && !stop_signals) {
+        result = 1;
+        goto cleanup;
+    }
     if (once && !stop_signals)
         fprintf(stderr, "holding last frame until SIGTERM\n");
     if (signal_prepare_fade(&stop_signals, once) < 0) {
@@ -693,6 +698,83 @@ cleanup:
     return result;
 }
 
+/* A positive result hands the existing frame to the next animation without
+ * an exit fade; zero means playback finished and performed its exit fade. */
+static int play_animation(const char *path, struct fb_surface *surface,
+                          int target_fps, int fade_ms, int once, int handoff,
+                          int *notified)
+{
+    struct run_stats stats = {0};
+    const char *stream_failure = "none";
+    const char *live_failure = "not attempted";
+    const char *selected_mode = "stream";
+    int result = 0;
+    struct stream *stream = stream_load(path, surface, &stream_failure);
+    if (stream) {
+        if (stream_play(stream, surface, once, notified, &stats) == 0) {
+            if (handoff && !stop_signals) {
+                result = 1;
+                goto finished;
+            }
+            if (once && !stop_signals)
+                fprintf(stderr, "holding last frame until SIGTERM\n");
+            if (signal_prepare_fade(&stop_signals, once) < 0) {
+                perror("signal wait setup failed");
+                stream_failure = "signal wait setup failed";
+                selected_mode = "failed";
+                result = -1;
+                fb_clear_visible(surface);
+                goto finished;
+            }
+            if (stream_fade_out(stream, surface, fade_ms, &stats) < 0) {
+                stream_failure = "stream fade snapshot allocation failed";
+                fprintf(stderr, "stream failure: %s\n", stream_failure);
+                selected_mode = "failed";
+                result = -1;
+            }
+            goto finished;
+        }
+        stream_failure = "stream decompression failed";
+        fprintf(stderr, "stream failure: %s\n", stream_failure);
+        stream_free(stream);
+        stream = NULL;
+    }
+
+    char live_path[PATH_MAX];
+    selected_mode = "live";
+    fprintf(stderr, "render mode: live (stream failure: %s)\n", stream_failure);
+    if (animation_live_path(live_path, sizeof(live_path), path) < 0) {
+        live_failure = "live fallback path is too long";
+        selected_mode = "failed";
+        result = -1;
+    } else {
+        result = render_live(live_path, surface, target_fps, fade_ms, once,
+                             handoff, notified, &stats, &live_failure);
+        if (result < 0)
+            selected_mode = "failed";
+        else
+            live_failure = "none";
+    }
+    if (result < 0)
+        fprintf(stderr, "live failure: %s\n", live_failure);
+
+finished:
+    stream_free(stream);
+    fprintf(stderr,
+            "summary: mode=%s stream_failure=\"%s\" live_failure=\"%s\" "
+            "stage=%s shown=%llu skipped=%llu fade_shown=%llu "
+            "fade_skipped=%llu missed_deadlines=%llu max_lateness_ms=%llu\n",
+            selected_mode, stream_failure, live_failure,
+            handoff ? "intro" : "main",
+            (unsigned long long)stats.frames_shown,
+            (unsigned long long)stats.frames_skipped,
+            (unsigned long long)stats.fade_frames_shown,
+            (unsigned long long)stats.fade_frames_skipped,
+            (unsigned long long)stats.missed_deadlines,
+            (unsigned long long)stats.max_lateness_ms);
+    return result;
+}
+
 static struct fb_channel_layout channel_layout(struct fb_bitfield field)
 {
     struct fb_channel_layout result = {
@@ -706,6 +788,7 @@ static struct fb_channel_layout channel_layout(struct fb_bitfield field)
 int main(int argc, char *argv[])
 {
     const char *lottie_path = NULL;
+    const char *intro_path = NULL;
     int target_fps = 0;
     int fade_ms = 1000;
     int once = 0;
@@ -717,6 +800,12 @@ int main(int argc, char *argv[])
             target_fps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fade-ms") == 0 && i + 1 < argc) {
             fade_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--intro") == 0) {
+            if (i + 1 == argc) {
+                fprintf(stderr, "--intro requires an animation path\n");
+                return 1;
+            }
+            intro_path = argv[++i];
         } else if (strcmp(argv[i], "--once") == 0) {
             once = 1;
         } else if (strcmp(argv[i], "--sound") == 0 && i + 1 < argc) {
@@ -730,7 +819,7 @@ int main(int argc, char *argv[])
 
     if (!lottie_path) {
         fprintf(stderr,
-                "usage: boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]\n");
+                "usage: boot-animation <lottie.json> [--intro intro.json] [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]\n");
         return 1;
     }
 
@@ -801,76 +890,25 @@ int main(int argc, char *argv[])
             fb_pixel_format_name(surface.format), surface.stride,
             surface.visible_offset, surface.mapping_size);
 
-    struct run_stats stats = {0};
-    const char *stream_failure = "none";
-    const char *live_failure = "not attempted";
-    const char *selected_mode = "stream";
     int notified = 0;
     int result = 0;
-
-    audio_start(sound_path, audio_device);
-
-    struct stream *stream = stream_load(lottie_path, &surface,
-                                        &stream_failure);
-    if (stream) {
-        if (stream_play(stream, &surface, once, &notified, &stats) == 0) {
-            if (once && !stop_signals)
-                fprintf(stderr, "holding last frame until SIGTERM\n");
-            if (signal_prepare_fade(&stop_signals, once) < 0) {
-                perror("signal wait setup failed");
-                stream_failure = "signal wait setup failed";
-                selected_mode = "failed";
-                result = 1;
-                fb_clear_visible(&surface);
-                goto finished;
-            }
-            if (stream_fade_out(stream, &surface, fade_ms, &stats) < 0) {
-                stream_failure = "stream fade snapshot allocation failed";
-                fprintf(stderr, "stream failure: %s\n", stream_failure);
-                selected_mode = "failed";
-                result = 1;
-            }
+    if (intro_path) {
+        int intro = play_animation(intro_path, &surface, target_fps, fade_ms,
+                                    1, 1, &notified);
+        if (intro == 0 || stop_signals)
             goto finished;
-        }
-        stream_failure = "stream decompression failed";
-        fprintf(stderr, "stream failure: %s\n", stream_failure);
-        stream_free(stream);
-        stream = NULL;
+        if (intro < 0)
+            fprintf(stderr, "intro unavailable; continuing with main animation\n");
     }
 
-    char live_path[PATH_MAX];
-    selected_mode = "live";
-    fprintf(stderr, "render mode: live (stream failure: %s)\n",
-            stream_failure);
-    if (animation_live_path(live_path, sizeof(live_path), lottie_path) < 0) {
-        live_failure = "live fallback path is too long";
-        selected_mode = "failed";
-        result = 1;
-    } else if (render_live(live_path, &surface, target_fps, fade_ms, once,
-                           &notified, &stats, &live_failure) < 0) {
-        selected_mode = "failed";
-        result = 1;
-    } else {
-        live_failure = "none";
+    if (!stop_signals) {
+        audio_start(sound_path, audio_device);
+        result = play_animation(lottie_path, &surface, target_fps, fade_ms,
+                                 once, 0, &notified) < 0 ? 1 : 0;
     }
-    if (result != 0)
-        fprintf(stderr, "live failure: %s\n", live_failure);
 
 finished:
     audio_stop_and_wait();
-    stream_free(stream);
-    fprintf(stderr,
-            "summary: mode=%s stream_failure=\"%s\" live_failure=\"%s\" "
-            "shown=%llu skipped=%llu fade_shown=%llu fade_skipped=%llu "
-            "missed_deadlines=%llu max_lateness_ms=%llu\n",
-            selected_mode, stream_failure, live_failure,
-            (unsigned long long)stats.frames_shown,
-            (unsigned long long)stats.frames_skipped,
-            (unsigned long long)stats.fade_frames_shown,
-            (unsigned long long)stats.fade_frames_skipped,
-            (unsigned long long)stats.missed_deadlines,
-            (unsigned long long)stats.max_lateness_ms);
-
     munmap(mapping, mapping_size);
     close(fb_fd);
     return result;

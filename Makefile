@@ -17,10 +17,11 @@ COMMON_SOURCES := render_utils.c signal_utils.c stream_format.c
 PLAYER_SOURCES := audio_playback.c $(COMMON_SOURCES)
 TEST_BINARY := $(BUILD_DIR)/test-render-utils
 STREAM_CHECK_BINARY := $(BUILD_DIR)/check-stream
+PLAYBACK_TEST_BINARY := $(BUILD_DIR)/test-playback
 
 CC_ARM := arm-linux-gnueabihf-gcc
 
-.PHONY: build build-arm build-host tools test test-packer dist clean FORCE
+.PHONY: build build-arm build-host tools test test-packer test-playback dist clean FORCE
 
 build-host: $(BUILD_DIR)/$(BINARY_NAME)
 	@echo "Built $(BUILD_DIR)/$(BINARY_NAME) for host"
@@ -60,6 +61,14 @@ $(STREAM_CHECK_BINARY): tests/check_stream.c stream.h stream_format.c FORCE
 
 test-packer: $(BUILD_DIR)/lottie2stream $(STREAM_CHECK_BINARY)
 	tests/test_lottie2stream.sh $(BUILD_DIR)/lottie2stream $(STREAM_CHECK_BINARY)
+
+test-playback: $(PLAYBACK_TEST_BINARY)
+	$(PLAYBACK_TEST_BINARY)
+
+$(PLAYBACK_TEST_BINARY): tests/test_playback.c main.c audio_playback.h render_utils.h signal_utils.h stream.h $(PLAYER_SOURCES) FORCE
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(THORVG_CPPFLAGS) $(CFLAGS) -std=c11 -I. -o $@ \
+		tests/test_playback.c $(PLAYER_SOURCES) $(LDFLAGS) $(THORVG_LDFLAGS) $(LIBS)
 
 FORCE:
 

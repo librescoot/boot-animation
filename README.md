@@ -11,6 +11,7 @@ Part of the [Librescoot](https://librescoot.org/) open-source platform.
 - Supports RGB565 and XRGB8888/ARGB8888 framebuffers, including padded row strides
 - Scales animation proportionally to fit display resolution
 - Loops indefinitely by default; `--once` plays once then holds the last frame
+- Optional `--intro` plays a separate clip once before the main animation
 - Fade-to-black on exit (driven by SIGTERM)
 - `sd_notify` integration (signals `READY=1` after the first displayed frame)
 - Animation selectable via kernel command line (`boot.animation=name`)
@@ -103,20 +104,37 @@ boundaries, fallback path derivation, and malformed or oversized streams.
 Caller-supplied `CPPFLAGS`, `CFLAGS`, and `LDFLAGS` are honored, including for
 sanitizer builds through this target.
 
+`make test-playback` additionally uses ThorVG and ALSA to exercise one-shot
+intro handoff, main-only looping, live fallback and interruption with an
+in-memory framebuffer and a simulated clock. It never opens `/dev/fb0`.
+
 ## Usage
 
 ```
-boot-animation <lottie.json> [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]
+boot-animation <lottie.json> [--intro intro.json] [--fps N] [--fade-ms N] [--once] [--sound WAV] [--audio-device PCM]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `<lottie.json>` | *(required)* | Path to the Lottie animation, or to a `.lsba` stream |
+| `--intro FILE` | off | Play this clip once, without a hold or exit fade, before the main animation |
 | `--fps N` | animation's native FPS | Target render frame rate; also used if the animation reports zero duration |
 | `--fade-ms N` | `1000` | Fade-to-black duration in milliseconds on exit |
 | `--once` | off | Play once, hold the last frame, then wait for SIGTERM |
 | `--sound WAV` | off | Play a 48 kHz mono or stereo 16-bit PCM WAV during animation playback |
 | `--audio-device PCM` | `auto` | ALSA PCM device; automatic selection prefers the built-in output |
+
+### Intro playback
+
+An intro uses the same stream-first/live-JSON fallback as the main animation.
+Its first frame signals readiness, so dashboard startup does not wait for the
+intro to finish. Completion preserves the last frame while the main animation
+loads; only the main animation loops. Startup audio begins with the main
+animation, after the intro. An unavailable intro is logged and skipped.
+
+SIGTERM during the intro fades that frame and exits without starting the main
+animation or its audio. The Windows XP theme uses this for a POST screen that
+continues the kernel splash before switching to the XP loading animation.
 
 ### Exit behaviour
 
